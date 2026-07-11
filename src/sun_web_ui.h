@@ -24,6 +24,7 @@ background:linear-gradient(90deg,#f7b733,#fc4a1a);-webkit-background-clip:text;b
 .ctl button{flex:1;padding:13px 10px;font-size:16px}
 .net{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:12px;font:12px ui-monospace,Consolas,monospace}
 .net span{color:var(--mut)}.net b{color:var(--tx);font-weight:600}
+.net a{color:var(--acc);font-weight:600;text-decoration:none}.net a:hover{text-decoration:underline}
 button{border:0;border-radius:9px;padding:11px 20px;font-size:15px;font-weight:600;color:#fff;cursor:pointer}
 button:active{transform:translateY(1px)}
 .b-start{background:var(--grn)}.b-test{background:var(--yel)}.b-stop{background:var(--red)}
@@ -43,7 +44,7 @@ legend{color:var(--acc);font-size:13px;text-transform:capitalize}
 input{background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px;font:inherit}
 input:focus{outline:none;border-color:var(--acc)}
 .f input{flex:1}
-.arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:52px;flex:0 0 auto;padding:6px 4px;text-align:center}
+.arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:64px;flex:0 0 auto;padding:6px 4px;text-align:center}
 .foot{text-align:center;color:var(--mut);font-size:12px;margin-top:22px}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1f6feb;color:#fff;
 padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
@@ -58,9 +59,9 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <button class="b-stop"  onclick="ctl('stop')">Stop</button>
 </div>
 <div class="net" id="net">
-<div><span>STA&nbsp;IP:</span> <b id="n_sta">--</b></div>
+<div><span>STA&nbsp;IP:</span> <a id="n_sta" target="_blank" rel="noopener">--</a></div>
 <div><span>AP&nbsp;IP:</span> <b id="n_ap">--</b></div>
-<div><span>mDNS:</span> <b id="n_mdns">--</b></div>
+<div><span>mDNS:</span> <a id="n_mdns" target="_blank" rel="noopener">--</a></div>
 </div></div>
 
 <div class="card"><h2>Status</h2>
@@ -92,7 +93,10 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <script>
 const $=s=>document.querySelector(s);
 const COLORS=['#f4d35e','#e07a5f','#81b29a','#5f9ea0','#c77dff','#6ca6ff','#f28482','#b5e48c'];
+const PLANETS=['Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune'];
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),1600)}
+function setLink(a,ip,fallback){if(ip){a.textContent=ip;a.href='http://'+ip+'/';}
+ else{a.textContent=fallback;a.removeAttribute('href');}}
 function hms(s){s=Math.max(0,s|0);const h=String(s/3600|0).padStart(2,'0'),
 m=String(s/60%60|0).padStart(2,'0'),x=String(s%60).padStart(2,'0');return h+':'+m+':'+x}
 
@@ -156,8 +160,9 @@ function anim(t){
 function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
  $('#mode').textContent='Mode: '+d.mode;
  $('#timer').textContent=hms(d.countdown?d.phase_remaining_s:d.phase_elapsed_s);
- if(d.net){$('#n_sta').textContent=d.net.sta_ip||'not connected';
-  $('#n_ap').textContent=d.net.ap_ip||'--';$('#n_mdns').textContent=d.net.mdns||'--';}
+ if(d.net){setLink($('#n_sta'),d.net.sta_ip,'not connected');
+  $('#n_ap').textContent=d.net.ap_ip||'--';
+  setLink($('#n_mdns'),d.net.mdns,'--');}
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
   p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
@@ -178,6 +183,14 @@ function mkInput(v,path){
  return inp;
 }
 function render(key,val,path){
+ if(key==='mac_address'&&Array.isArray(val)){   // one labelled line per planet
+  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
+  lg.textContent=key;fs.appendChild(lg);
+  val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
+   const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
+   f.appendChild(l);f.appendChild(mkInput(el,path.concat(i)));fs.appendChild(f);});
+  return fs;
+ }
  if(Array.isArray(val)){
   const fs=document.createElement('fieldset');const lg=document.createElement('legend');
   lg.textContent=key;fs.appendChild(lg);
