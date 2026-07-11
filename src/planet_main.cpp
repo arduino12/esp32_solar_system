@@ -75,6 +75,7 @@ static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
 static uint32_t g_nextStatusMs = 0;        // next scheduled status transmit
 static uint32_t g_lastFaultMs = 0;         // last TMC fault poll
 static uint32_t g_channelScanMs = 0;       // last channel (re)scan while offline
+static uint32_t g_lastDbgMs   = 0;         // periodic debug heartbeat print
 
 // HOME sensor (ISR-driven, one pulse per revolution).
 static volatile bool     g_homePulse = false;   // consumed by status TX
@@ -351,7 +352,10 @@ static void updateState() {
 // ----------------------------- Setup / loop ----------------------------------
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  uint32_t tUsb = millis();                // wait for the USB-CDC host to attach so the
+  while (!Serial && millis() - tUsb < 3000) delay(10);   // boot banner isn't lost
+  delay(300);
+  Serial.println("\n==== Solar System - PLANET boot ====");
 
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
   pinMode(PIN_LIGHT_EN, OUTPUT);   digitalWrite(PIN_LIGHT_EN, LOW);
@@ -402,5 +406,14 @@ void loop() {
   if (g_state == ST_OFFLINE && now - g_channelScanMs > 5000) {
     g_channelScanMs = now;
     discoverChannel();
+  }
+
+  // Debug heartbeat: always emit something so a late-connecting monitor sees the cart is alive.
+  if (now - g_lastDbgMs > 2000) {
+    g_lastDbgMs = now;
+    const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
+    Serial.printf("[%lus] %s  sun=%d idx=%u err=%u light=%d motors=%d\n",
+                  (unsigned long)(now / 1000), st, g_sunKnown ? 1 : 0,
+                  g_myIndex, g_error, g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }
