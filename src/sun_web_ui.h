@@ -1,0 +1,190 @@
+// sun_web_ui.h — single-page web UI for the Sun controller, stored in flash (PROGMEM) and
+// served at "/". Talks to the firmware over the /api/* JSON endpoints. Included only by
+// sun_main.cpp. Pattern mirrors esp32s3_pov_cylinder/src/web_ui.h.
+#pragma once
+#include <Arduino.h>
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Solar System</title>
+<style>
+:root{--bg:#0b0e14;--card:#141a24;--edge:#232c3a;--tx:#e6edf3;--mut:#8b98a9;
+--grn:#2ea043;--yel:#d4a017;--red:#da3633;--acc:#f0a020}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+h1{text-align:center;font-weight:600;letter-spacing:.06em;margin:18px 0 6px;
+background:linear-gradient(90deg,#f7b733,#fc4a1a);-webkit-background-clip:text;background-clip:text;color:transparent}
+.wrap{max-width:760px;margin:0 auto;padding:0 14px 40px}
+.card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:16px;margin:14px 0}
+.card h2{margin:0 0 12px;font-size:15px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+button{border:0;border-radius:9px;padding:11px 20px;font-size:15px;font-weight:600;color:#fff;cursor:pointer}
+button:active{transform:translateY(1px)}
+.b-start{background:var(--grn)}.b-test{background:var(--yel)}.b-stop{background:var(--red)}
+.b-reset{background:var(--red);padding:8px 16px}
+.mode{font-size:14px;color:var(--mut)}
+.timer{font-size:46px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;margin:6px 0}
+svg{display:block;width:100%;max-width:400px;margin:0 auto}
+.stats{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:12px}
+.stat b{display:block;font-size:30px}
+.stat span{color:var(--mut);font-size:13px}
+#log{font:12px ui-monospace,Consolas,monospace;color:var(--mut);background:#0d1017;border:1px solid var(--edge);
+border-radius:8px;padding:8px;max-height:130px;overflow:auto;white-space:pre-wrap;margin-top:10px}
+fieldset{border:1px solid var(--edge);border-radius:8px;margin:8px 0;padding:8px 12px}
+legend{color:var(--acc);font-size:13px;text-transform:capitalize}
+.f{display:flex;align-items:center;gap:8px;margin:4px 0}
+.f label{flex:0 0 46%;color:var(--mut);font-size:13px}
+.f input{flex:1;background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px}
+.arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:70px;flex:0 0 auto}
+.foot{text-align:center;color:var(--mut);font-size:12px;margin-top:22px}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1f6feb;color:#fff;
+padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
+.toast.on{opacity:1}
+</style></head><body>
+<div class="wrap">
+<h1>Solar System</h1>
+
+<div class="card"><h2>Control</h2><div class="row">
+<button class="b-start" onclick="ctl('start')">Start</button>
+<button class="b-test"  onclick="ctl('test')">Test</button>
+<button class="b-stop"  onclick="ctl('stop')">Stop</button>
+</div></div>
+
+<div class="card"><h2>Status</h2>
+<div class="mode" id="mode">--</div>
+<div class="timer" id="timer">00:00:00</div>
+<svg viewBox="0 0 400 400" id="sky"></svg>
+<div id="log"></div>
+</div>
+
+<div class="card"><h2>Statistics</h2>
+<div class="stats">
+<div class="stat"><b id="st_trig">0</b><span>Presses that started the show</span></div>
+<div class="stat"><b id="st_ign">0</b><span>Presses ignored</span></div>
+</div>
+<button class="b-reset" onclick="resetStats()">Reset statistics</button>
+</div>
+
+<div class="card"><h2>Settings</h2>
+<div id="settings"></div>
+<div class="row" style="margin-top:10px">
+<button class="b-start" onclick="saveCfg()">Save &amp; apply</button>
+</div></div>
+
+<div class="foot">By Didi, Arad and Calude 2026</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const COLORS=['#f4d35e','#e07a5f','#81b29a','#5f9ea0','#c77dff','#6ca6ff','#f28482','#b5e48c'];
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),1600)}
+function hms(s){s=Math.max(0,s|0);const h=String(s/3600|0).padStart(2,'0'),
+m=String(s/60%60|0).padStart(2,'0'),x=String(s%60).padStart(2,'0');return h+':'+m+':'+x}
+
+/* ---- control ---- */
+function ctl(a){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},
+body:JSON.stringify({action:a})}).then(()=>toast(a))}
+function resetStats(){if(confirm('Reset both statistics counters to zero?'))
+fetch('/api/stats/reset',{method:'POST'}).then(()=>{toast('reset');loadStats()})}
+function loadStats(){fetch('/api/stats').then(r=>r.json()).then(d=>{
+$('#st_trig').textContent=d.presses_triggered;$('#st_ign').textContent=d.presses_ignored})}
+
+/* ---- solar-system diagram ---- */
+const SVGNS='http://www.w3.org/2000/svg',CX=200,CY=200,N=8;
+const view=[];let sky;
+function buildSky(){
+ sky=$('#sky');
+ const sun=document.createElementNS(SVGNS,'circle');
+ sun.setAttribute('cx',CX);sun.setAttribute('cy',CY);sun.setAttribute('r',16);
+ sun.setAttribute('fill','#fdb813');sun.setAttribute('filter','url(#g)');
+ const defs=document.createElementNS(SVGNS,'defs');
+ defs.innerHTML='<filter id="g"><feGaussianBlur stdDeviation="3"/></filter>';
+ sky.appendChild(defs);
+ for(let i=0;i<N;i++){
+  const r=34+i*21;
+  const ring=document.createElementNS(SVGNS,'circle');
+  ring.setAttribute('cx',CX);ring.setAttribute('cy',CY);ring.setAttribute('r',r);
+  ring.setAttribute('fill','none');ring.setAttribute('stroke','#2a3342');ring.setAttribute('stroke-width',1);
+  sky.appendChild(ring);
+  const aura=document.createElementNS(SVGNS,'circle');
+  aura.setAttribute('r',11);aura.setAttribute('fill','none');
+  const dot=document.createElementNS(SVGNS,'circle');
+  dot.setAttribute('r',6);
+  const err=document.createElementNS(SVGNS,'path');
+  err.setAttribute('d','M0,-7 L7,6 L-7,6 Z');err.setAttribute('fill','#da3633');
+  err.setAttribute('stroke','#fff');err.setAttribute('stroke-width',.7);err.style.display='none';
+  sky.appendChild(aura);sky.appendChild(dot);sky.appendChild(err);
+  view.push({r,angle:i%2?270:90,orbital:0,online:false,light:false,error:0,
+             homeDeg:i%2?270:90,homeCount:-1,aura,dot,err});
+ }
+ sky.appendChild(sun);
+ requestAnimationFrame(anim);
+}
+let last=0;
+function anim(t){
+ const dt=last?t-last:16;last=t;
+ for(const p of view){
+  if(p.online) p.angle+=p.orbital*360/60000*dt;  // rpm -> deg/ms
+  const a=p.angle*Math.PI/180, x=CX+p.r*Math.cos(a), y=CY+p.r*Math.sin(a);
+  p.dot.setAttribute('cx',x);p.dot.setAttribute('cy',y);
+  p.dot.setAttribute('fill',p.online?p.color:'#3b4557');
+  p.aura.setAttribute('cx',x);p.aura.setAttribute('cy',y);
+  p.aura.setAttribute('stroke',p.light?p.color:'none');
+  p.aura.setAttribute('stroke-width',p.light?3:0);p.aura.setAttribute('opacity',.5);
+  p.err.setAttribute('transform','translate('+x+','+(y-2)+')');
+  p.err.style.display=p.error?'block':'none';
+ }
+ requestAnimationFrame(anim);
+}
+
+/* ---- status poll ---- */
+function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
+ $('#mode').textContent='Mode: '+d.mode;
+ $('#timer').textContent=hms(d.countdown?d.phase_remaining_s:d.phase_elapsed_s);
+ d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
+  p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
+  p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
+  if(pl.home_count!==p.homeCount){p.homeCount=pl.home_count;if(p.homeCount>0)p.angle=p.homeDeg}
+ });
+ $('#log').textContent=(d.log||[]).join('\n');
+}).catch(()=>{})}
+
+/* ---- settings (recursive form bound to a live cfg object) ---- */
+let cfg=null;
+function setPath(o,path,v){let n=o;for(let i=0;i<path.length-1;i++)n=n[path[i]];n[path[path.length-1]]=v}
+function mkInput(v,path){
+ const inp=document.createElement('input');
+ if(typeof v==='boolean'){inp.type='checkbox';inp.checked=v;
+  inp.onchange=()=>setPath(cfg,path,inp.checked)}
+ else{inp.type=(typeof v==='number')?'number':'text';inp.step='any';inp.value=v;
+  inp.onchange=()=>setPath(cfg,path,inp.type==='number'?parseFloat(inp.value):inp.value)}
+ return inp;
+}
+function render(key,val,path){
+ if(Array.isArray(val)){
+  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
+  lg.textContent=key;fs.appendChild(lg);
+  const box=document.createElement('div');box.className='arr';
+  val.forEach((el,i)=>box.appendChild(mkInput(el,path.concat(i))));
+  fs.appendChild(box);return fs;
+ }
+ if(val&&typeof val==='object'){
+  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
+  lg.textContent=key;fs.appendChild(lg);
+  for(const k in val)fs.appendChild(render(k,val[k],path.concat(k)));
+  return fs;
+ }
+ const f=document.createElement('div');f.className='f';
+ const l=document.createElement('label');l.textContent=key;
+ f.appendChild(l);f.appendChild(mkInput(val,path));return f;
+}
+function loadCfg(){fetch('/api/settings').then(r=>r.json()).then(d=>{cfg=d;
+ const box=$('#settings');box.innerHTML='';
+ for(const k in d)box.appendChild(render(k,d[k],[k]));})}
+function saveCfg(){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+ body:JSON.stringify(cfg)}).then(()=>{toast('saved');setTimeout(loadCfg,300)})}
+
+buildSky();loadStats();loadCfg();poll();setInterval(poll,1000);setInterval(loadStats,5000);
+</script></body></html>)HTML";
