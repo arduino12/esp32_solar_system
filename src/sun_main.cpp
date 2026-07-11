@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
@@ -43,6 +44,7 @@ static uint32_t  g_lastFireMs = 0;
 #define STA_RETRY_MS    60000
 #define FACTORY_HOLD_MS 5000
 #define LOG_N           12
+#define MDNS_HOST       "solar-system"     // reachable as solar-system.local
 
 // ----------------------------- Persistent state ------------------------------
 static JsonDocument g_settings;            // full settings.json in RAM
@@ -112,8 +114,16 @@ static bool g_staOk = false;
 static uint32_t g_lastStaTryMs = 0;
 
 // ----------------------------- Small helpers ---------------------------------
+static String fmtUptime() {
+  uint32_t s = millis() / 1000;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%02u:%02u:%02u",
+           (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
+  return String(buf);
+}
+
 static void addLog(const String &s) {
-  g_log[g_logHead] = String(millis() / 1000) + "s  " + s;
+  g_log[g_logHead] = fmtUptime() + "  " + s;
   g_logHead = (g_logHead + 1) % LOG_N;
 }
 
@@ -158,9 +168,15 @@ static void loadSettings() {
   }
 }
 
+static void saveStats();   // fwd
+
 static void loadStats() {
   File f = LittleFS.open("/stats.json", "r");
-  if (!f) { g_pressesTriggered = 0; g_pressesIgnored = 0; return; }
+  if (!f) {                                 // first boot: create it so it always exists
+    g_pressesTriggered = 0; g_pressesIgnored = 0;
+    saveStats();
+    return;
+  }
   JsonDocument d;
   if (!deserializeJson(d, f)) {
     g_pressesTriggered = d["presses_triggered"] | 0;
@@ -522,8 +538,13 @@ static void buildStatusJson(String &out) {
     o["error"]       = g_planet[i].error;
     o["orbital_rpm"] = g_planet[i].orbitalRpm;
     o["home_count"]  = g_planet[i].homeCount;
-    o["home_deg"]    = (i % 2 == 0) ? 90 : 270;
+    o["home_deg"]    = (i % 2 == 0) ? 180 : 0;   // home line spread horizontally (L/R)
   }
+
+  JsonObject net = d["net"].to<JsonObject>();
+  net["ap_ip"]  = WiFi.softAPIP().toString();
+  net["sta_ip"] = g_staOk ? WiFi.localIP().toString() : String("");
+  net["mdns"]   = String(MDNS_HOST) + ".local";
 
   JsonArray lg = d["log"].to<JsonArray>();
   for (int k = 0; k < LOG_N; k++) {
@@ -637,6 +658,11 @@ void setup() {
   FastLED.show();
 
   wifiStart();
+
+  if (MDNS.begin(MDNS_HOST)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("mDNS: http://%s.local\n", MDNS_HOST);
+  }
 
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(onRecv);

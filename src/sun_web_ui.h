@@ -18,7 +18,12 @@ background:linear-gradient(90deg,#f7b733,#fc4a1a);-webkit-background-clip:text;b
 .wrap{max-width:760px;margin:0 auto;padding:0 14px 40px}
 .card{background:var(--card);border:1px solid var(--edge);border-radius:12px;padding:16px;margin:14px 0}
 .card h2{margin:0 0 12px;font-size:15px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin:0 0 12px}
+.cardhead h2{margin:0}
 .row{display:flex;gap:10px;flex-wrap:wrap}
+.ctl button{flex:1;padding:13px 10px;font-size:16px}
+.net{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:12px;font:12px ui-monospace,Consolas,monospace}
+.net span{color:var(--mut)}.net b{color:var(--tx);font-weight:600}
 button{border:0;border-radius:9px;padding:11px 20px;font-size:15px;font-weight:600;color:#fff;cursor:pointer}
 button:active{transform:translateY(1px)}
 .b-start{background:var(--grn)}.b-test{background:var(--yel)}.b-stop{background:var(--red)}
@@ -35,8 +40,10 @@ fieldset{border:1px solid var(--edge);border-radius:8px;margin:8px 0;padding:8px
 legend{color:var(--acc);font-size:13px;text-transform:capitalize}
 .f{display:flex;align-items:center;gap:8px;margin:4px 0}
 .f label{flex:0 0 46%;color:var(--mut);font-size:13px}
-.f input{flex:1;background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px}
-.arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:70px;flex:0 0 auto}
+input{background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px;font:inherit}
+input:focus{outline:none;border-color:var(--acc)}
+.f input{flex:1}
+.arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:52px;flex:0 0 auto;padding:6px 4px;text-align:center}
 .foot{text-align:center;color:var(--mut);font-size:12px;margin-top:22px}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1f6feb;color:#fff;
 padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
@@ -45,10 +52,15 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="wrap">
 <h1>Solar System</h1>
 
-<div class="card"><h2>Control</h2><div class="row">
+<div class="card"><h2>Control</h2><div class="row ctl">
 <button class="b-start" onclick="ctl('start')">Start</button>
 <button class="b-test"  onclick="ctl('test')">Test</button>
 <button class="b-stop"  onclick="ctl('stop')">Stop</button>
+</div>
+<div class="net" id="net">
+<div><span>STA&nbsp;IP:</span> <b id="n_sta">--</b></div>
+<div><span>AP&nbsp;IP:</span> <b id="n_ap">--</b></div>
+<div><span>mDNS:</span> <b id="n_mdns">--</b></div>
 </div></div>
 
 <div class="card"><h2>Status</h2>
@@ -58,12 +70,13 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div id="log"></div>
 </div>
 
-<div class="card"><h2>Statistics</h2>
+<div class="card">
+<div class="cardhead"><h2>Statistics</h2>
+<button class="b-reset" onclick="resetStats()">Reset</button></div>
 <div class="stats">
 <div class="stat"><b id="st_trig">0</b><span>Presses that started the show</span></div>
 <div class="stat"><b id="st_ign">0</b><span>Presses ignored</span></div>
 </div>
-<button class="b-reset" onclick="resetStats()">Reset statistics</button>
 </div>
 
 <div class="card"><h2>Settings</h2>
@@ -116,8 +129,8 @@ function buildSky(){
   err.setAttribute('d','M0,-7 L7,6 L-7,6 Z');err.setAttribute('fill','#da3633');
   err.setAttribute('stroke','#fff');err.setAttribute('stroke-width',.7);err.style.display='none';
   sky.appendChild(aura);sky.appendChild(dot);sky.appendChild(err);
-  view.push({r,angle:i%2?270:90,orbital:0,online:false,light:false,error:0,
-             homeDeg:i%2?270:90,homeCount:-1,aura,dot,err});
+  view.push({r,angle:i%2?0:180,orbital:0,online:false,light:false,error:0,
+             homeDeg:i%2?0:180,homeCount:-1,aura,dot,err});
  }
  sky.appendChild(sun);
  requestAnimationFrame(anim);
@@ -143,6 +156,8 @@ function anim(t){
 function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
  $('#mode').textContent='Mode: '+d.mode;
  $('#timer').textContent=hms(d.countdown?d.phase_remaining_s:d.phase_elapsed_s);
+ if(d.net){$('#n_sta').textContent=d.net.sta_ip||'not connected';
+  $('#n_ap').textContent=d.net.ap_ip||'--';$('#n_mdns').textContent=d.net.mdns||'--';}
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
   p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
