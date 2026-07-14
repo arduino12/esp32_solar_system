@@ -27,7 +27,7 @@ enum SolarMode : uint8_t {
 // Command verbs sent from Sun to a planet.
 enum PlanetCmd : uint8_t {
   CMD_STOP = 0,        // disable motors, lights off
-  CMD_RUN,             // run wheels at given rpm + spin the ball + optional light
+  CMD_RUN,             // run wheels at given rpm + optional light
   CMD_HOME_AND_STOP,   // drive until HOME pulse, then stop and disable motors
   CMD_LIGHT,           // set only the light state (no motion change)
 };
@@ -47,10 +47,10 @@ struct __attribute__((packed)) CmdMsg {
   uint8_t  command;       // PlanetCmd
   float    wheel_l_rpm;   // left wheel (outer track); sign = direction
   float    wheel_r_rpm;   // right wheel (inner track); sign = direction
-  float    spin_rpm;      // planet-ball axial spin (P motor); sign = direction
   uint8_t  light_on;      // 0/1
   uint16_t current_ma;    // TMC rms current to apply to all drivers
-  uint8_t  microsteps;    // TMC microsteps to apply (0 = full step, per TMCStepper)
+  uint8_t  microsteps;    // TMC microsteps (must be a valid power of 2: 1,2,4,...,256)
+  float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
 };
 
 // Planet -> Sun. Broadcast until the Sun's MAC is learned, then unicast to it.

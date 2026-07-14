@@ -61,7 +61,6 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
   },
   "planets": {
     "mac_address": ["","","","","","","",""],
-    "axial_rotation_speed_rpm": 30,
     "wheels": {
       "diameter_mm": 20,
       "stepper": { "current_amp": 1.5, "microsteps": 16, "step_degree": 1.8,
@@ -271,7 +270,6 @@ static CmdMsg buildRunCmd(int i, bool light) {
   float innerD    = pl["rail"]["inner_diameter_mm"][i] | 500.0f;
   float base      = pl["rail"]["log_scale_speed_rpm"][i] | 100.0f;
   float maxRpm    = pl["wheels"]["stepper"]["max_speed_rpm"][i] | 500.0f;
-  float spin      = pl["axial_rotation_speed_rpm"] | 30.0f;
 
   float Rin  = innerD * 0.5f;
   float Rout = Rin + railW;
@@ -288,10 +286,10 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.command     = CMD_RUN;
   m.wheel_l_rpm = wheelL * sign;
   m.wheel_r_rpm = wheelR * sign;
-  m.spin_rpm    = spin;
   m.light_on    = light ? 1 : 0;
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 1.5f) * 1000.0f);
   m.microsteps  = pl["wheels"]["stepper"]["microsteps"] | 16;
+  m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   return m;
 }
 
@@ -303,6 +301,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.light_on   = light ? 1 : 0;
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 1.5f) * 1000.0f);
   m.microsteps = pl["wheels"]["stepper"]["microsteps"] | 16;
+  m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
     float dWheel = pl["wheels"]["diameter_mm"] | 20.0f;
     float railW  = pl["rail"]["width_mm"]      | 70.0f;

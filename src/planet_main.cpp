@@ -9,10 +9,10 @@
 // by scanning for the Sun's AP SSID, locks onto that channel, then broadcasts status until
 // it hears a command (learning the Sun's MAC from the packet) and switches to unicast.
 //
-// Motors: 3x TMC2209 on one single-wire UART bus (addresses 0/1/2).
+// Motors: 2x TMC2209 on one single-wire UART bus (addresses 0/1). The planets do NOT spin
+// about their own axis (that motor was dropped) — they only roll around the rail and light up.
 //   - Left wheel  (outer rail track) -> FastAccelStepper step pulses (RMT), dir via UART shaft bit
 //   - Right wheel (inner rail track) -> FastAccelStepper step pulses (RMT), dir via UART shaft bit
-//   - Planet ball spin               -> TMC internal VACTUAL velocity mode (no MCU pulses)
 // DIR pins are tied to GND in hardware; direction is set over UART, so only 2 RMT channels
 // (both wheels) are needed — which is exactly what the C3 provides.
 
@@ -30,23 +30,23 @@ static const uint8_t PIN_TMC_RX     = 4;   // Serial1 RX  <- driver PDN/UART bus
 static const uint8_t PIN_TMC_TX     = 3;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
 static const uint8_t PIN_STEP_L     = 0;   // left  wheel step
 static const uint8_t PIN_STEP_R     = 1;   // right wheel step
-static const uint8_t PIN_STEP_P     = 5;   // planet-spin step (only used in LEDC fallback)
 static const uint8_t PIN_HOME       = 6;   // homing sensor, active-low, FALLING pulse/rev
 static const uint8_t PIN_LIGHT_EN   = 7;   // N-MOS gate for planet light
 static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
 static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 
 // ----------------------------- Motor / TMC config ---------------------------
-#define USE_VACTUAL_SPIN   1               // 1: spin ball via TMC VACTUAL; 0: LEDC PWM on PIN_STEP_P
 #define TMC_R_SENSE        0.11f
 #define TMC_UART_BAUD      115200
 #define TMC_ADDR_L         0b11            // MS1=VIO MS2=VIO
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
-#define TMC_ADDR_P         0b00            // MS1=GND MS2=GND
-#define MOTOR_FULL_STEPS   200             // 1.8 deg/step
-#define WHEEL_ACCEL_RPM_S  300.0f          // wheel acceleration ramp (rpm per second)
-#define LEDC_SPIN_CH       0               // LEDC channel for spin fallback
-#define LEDC_SPIN_RES      8               // LEDC resolution bits
+#define WHEEL_ACCEL_RPM_S  50.0f           // wheel accel/decel ramp (rpm per second) — gentle
+                                           // start/stop: 0->300 rpm takes ~6 s.
+// StallGuard load below this while a wheel is commanded to move = mechanically stuck.
+// TMC2209 StallGuard needs per-rig tuning; watch sgL/sgR in the serial heartbeat and set this
+// a little above the "held" reading but below the free-running reading. 0 disables the check.
+#define STALL_SG_MIN       0
+#define FAULT_DEBOUNCE     3               // consecutive bad polls before a fault is latched
 
 // ----------------------------- Radio / power --------------------------------
 // The C3 runs warm because its Wi-Fi radio is always on for ESP-NOW. Two levers reduce it:
@@ -58,13 +58,13 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define OFFLINE_RESCAN_MS  10000
 
 // Boot defaults (overwritten by the first command from the Sun).
-static uint16_t g_currentMa  = 1000;       // current_amp=1.0
-static uint8_t  g_microsteps = 16;
+static uint16_t g_currentMa   = 1000;      // current_amp=1.0
+static uint8_t  g_microsteps  = 16;
+static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev = 360/step_degree
 
 HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
 TMC2209Stepper   drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
-TMC2209Stepper   drvP(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_P);
 
 FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper *stepL = nullptr;
@@ -83,11 +83,13 @@ static uint8_t  g_error       = ERR_NONE;
 // Last commanded motion (for status/debug; the cart is a dumb executor of the Sun's numbers).
 static float    g_cmdWheelL   = 0;
 static float    g_cmdWheelR   = 0;
-static float    g_cmdSpin     = 0;
+static bool     g_stopDisable = false;     // decelerate first, cut driver power once stopped
 
 // Diagnostics reported back to the Sun and printed in the heartbeat.
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
+static uint16_t g_sgL = 0, g_sgR = 0;      // last StallGuard load readings (for tuning)
+static uint8_t  g_drvStat = 0;             // last open-load/overtemp flag snapshot (bitfield)
 
 static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
 static uint32_t g_nextStatusMs = 0;        // next scheduled status transmit
@@ -136,28 +138,48 @@ static float readDieTempC() {
 }
 
 static inline uint32_t rpmToStepsHz(float rpm) {
-  // |rpm| -> microsteps per second
-  return (uint32_t)((fabsf(rpm) / 60.0f) * (float)MOTOR_FULL_STEPS * (float)g_microsteps);
+  // |rpm| -> microsteps per second. Speed is fully defined by RPM and the step angle
+  // (360/step_degree full steps per rev); microsteps scales the pulse rate AND the driver's
+  // divisor equally, so the resulting shaft RPM is independent of the microstep setting.
+  float fullStepsPerRev = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
+  return (uint32_t)((fabsf(rpm) / 60.0f) * fullStepsPerRev * (float)g_microsteps);
+}
+
+// Round an arbitrary microstep request to the nearest valid TMC2209 value (power of two,
+// 1..256). Keeps the pulse-rate math and the driver's divisor in agreement even if a bad
+// value slips through, which is what would otherwise make RPM drift when microsteps change.
+static uint8_t sanitizeMicrosteps(uint8_t m) {
+  const uint8_t valid[] = {1, 2, 4, 8, 16, 32, 64, 128, 255};  // 255 => 256 per TMCStepper
+  uint8_t best = 16; uint16_t bestErr = 0xFFFF;
+  for (uint8_t v : valid) {
+    uint16_t e = (v > m) ? (v - m) : (m - v);
+    if (e < bestErr) { bestErr = e; best = v; }
+  }
+  return best;
 }
 
 static void applyDriverParams() {
-  // Re-apply current/microsteps to all three drivers (called at boot and on every command
-  // that changes them). Mirrors the bring-up sequence used in rotating_rods_skr_pico.
-  TMC2209Stepper *all[3] = {&drvL, &drvR, &drvP};
+  // Re-apply current/microsteps to both wheel drivers (called at boot and on every command
+  // that changes them). Mirrors the bring-up sequence used in rotating_rods_skr_pico, plus
+  // low-heat standstill settings: hold current = 0 + freewheel so a stopped-but-enabled motor
+  // dissipates almost nothing (the planets never need to hold position precisely).
+  TMC2209Stepper *all[2] = {&drvL, &drvR};
   for (auto *d : all) {
-    d->rms_current(g_currentMa);
+    d->rms_current(g_currentMa, 0.0f);     // IRUN from mA; IHOLD = 0 (see freewheel below)
     d->microsteps(g_microsteps);
     d->intpol(g_microsteps >= 8);
     d->en_spreadCycle(g_microsteps < 8);   // stealthChop at >=8, spreadCycle below
+    d->TPOWERDOWN(20);                      // ~0.4 s after stop, drop to standstill state
+    d->freewheel(1);                        // IHOLD=0 -> coils freewheel at standstill (no heat)
   }
 }
 
 static void tmcBringup() {
   TMC_SERIAL.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_RX, PIN_TMC_TX);
-  TMC2209Stepper *all[3] = {&drvL, &drvR, &drvP};
+  TMC2209Stepper *all[2] = {&drvL, &drvR};
   for (auto *d : all) {
     d->begin();
-    d->toff(4);
+    d->toff(0);                 // chopper off until motors are enabled (driver fully idle/cool)
     d->pdn_disable(true);       // required so UART (not the PDN pin) controls the driver
     d->I_scale_analog(false);   // internal Vref (ignore VREF pin)
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
@@ -165,8 +187,13 @@ static void tmcBringup() {
   applyDriverParams();
 }
 
+// Enable/disable the driver power stage. Beyond the EN pin we also gate the chopper (toff):
+// with toff=0 the output MOSFETs are off, so a disabled driver draws only chip quiescent
+// current and stays cool. Planets are idle most of the time, so this is the dominant saving.
 static void motorsEnable(bool on) {
+  if (on) { drvL.toff(4); drvR.toff(4); }
   digitalWrite(PIN_TMC_EN, on ? LOW : HIGH);  // active-low
+  if (!on) { drvL.toff(0); drvR.toff(0); }
   g_motorsOn = on;
 }
 
@@ -191,22 +218,6 @@ static void wheelRun(FastAccelStepper *st, TMC2209Stepper &drv, float rpm) {
 static void wheelsStop() {
   if (stepL) stepL->stopMove();
   if (stepR) stepR->stopMove();
-}
-
-// Planet-ball spin at a signed rpm using the TMC internal velocity generator (VACTUAL),
-// or LEDC PWM step clock as a fallback. VACTUAL[Hz] = VACTUAL_reg * fclk / 2^24, fclk~12MHz.
-static void spinSet(float rpm) {
-#if USE_VACTUAL_SPIN
-  int32_t microPerSec = (int32_t)((rpm / 60.0f) * (float)MOTOR_FULL_STEPS * (float)g_microsteps);
-  int32_t vactual = (int32_t)((float)microPerSec / 0.715f);   // 12e6 / 2^24
-  drvP.VACTUAL(vactual);
-#else
-  uint32_t hz = rpmToStepsHz(rpm);
-  if (hz == 0) { ledcWrite(LEDC_SPIN_CH, 0); return; }
-  ledcSetup(LEDC_SPIN_CH, hz, LEDC_SPIN_RES);
-  ledcAttachPin(PIN_STEP_P, LEDC_SPIN_CH);
-  ledcWrite(LEDC_SPIN_CH, 1 << (LEDC_SPIN_RES - 1));          // 50% duty
-#endif
 }
 
 // ----------------------------- ESP-NOW --------------------------------------
@@ -235,41 +246,42 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
     addPeer(g_sunMac);
   }
 
-  // Apply driver parameters if they changed.
-  if (m.current_ma != g_currentMa || m.microsteps != g_microsteps) {
+  // Apply driver parameters if they changed. Microsteps is snapped to a valid TMC value so the
+  // pulse rate and the driver divisor always agree (otherwise RPM would shift with microsteps).
+  uint8_t us = sanitizeMicrosteps(m.microsteps);
+  if (m.current_ma != g_currentMa || us != g_microsteps || fabsf(m.step_degree - g_stepDegree) > 0.001f) {
     g_currentMa  = m.current_ma;
-    g_microsteps = m.microsteps;
+    g_microsteps = us;
+    if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
     applyDriverParams();
   }
 
   switch (m.command) {
     case CMD_STOP:
       g_homingStop = false;
-      g_cmdWheelL = 0; g_cmdWheelR = 0; g_cmdSpin = 0;
-      wheelsStop(); spinSet(0);
-      motorsEnable(false);
+      g_cmdWheelL = 0; g_cmdWheelR = 0;
+      wheelsStop();                 // decelerate on the ramp; power is cut once stopped
+      g_stopDisable = true;
       lightSet(false);
       break;
 
     case CMD_RUN:
-      g_homingStop = false;
-      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm; g_cmdSpin = m.spin_rpm;
+      g_homingStop = false; g_stopDisable = false;
+      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
       motorsEnable(true);
       wheelRun(stepL, drvL, m.wheel_l_rpm);
       wheelRun(stepR, drvR, m.wheel_r_rpm);
-      spinSet(m.spin_rpm);
       lightSet(m.light_on);
       break;
 
     case CMD_HOME_AND_STOP:
       // Drive both wheels slowly toward HOME; homing logic stops on the pulse.
-      g_homingStop = true;
+      g_homingStop = true; g_stopDisable = false;
       g_homeSeen   = false;
-      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm; g_cmdSpin = 0;
+      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
       motorsEnable(true);
       wheelRun(stepL, drvL, m.wheel_l_rpm);
       wheelRun(stepR, drvR, m.wheel_r_rpm);
-      spinSet(0);
       lightSet(m.light_on);
       break;
 
@@ -336,32 +348,54 @@ static void serviceStatusLed() {
 }
 
 // ----------------------------- Fault polling --------------------------------
+// TMC2209 fault sensing is inherently limited: test_connection() only proves the *driver chip*
+// answers over UART (it stays "OK" if you unplug just the motor coils), and open-load /
+// StallGuard flags are only meaningful while the coils are actually being driven. So we sample
+// them only when the motor is enabled and moving, and require several consecutive bad polls
+// (FAULT_DEBOUNCE) before latching a fault, to avoid the flags' well-known false positives.
 static void serviceFaults() {
   if (millis() - g_lastFaultMs < 500) return;
   g_lastFaultMs = millis();
 
-  uint8_t err = ERR_NONE;
-  // A failed UART round-trip => driver/harness disconnected.
-  if (drvL.test_connection() != 0 || drvR.test_connection() != 0) {
-    err = ERR_MOTOR_DISCONNECTED;
-  } else if (g_motorsOn) {
-    // Open-load flags in DRV_STATUS indicate an unplugged/broken coil.
-    if (drvL.ola() || drvL.olb() || drvR.ola() || drvR.olb()) err = ERR_MOTOR_DISCONNECTED;
-    // Stall while commanded to move (StallGuard result near zero) => stuck. Tunable.
-    else if (((stepL && stepL->isRunning()) || (stepR && stepR->isRunning())) &&
-             (drvL.SG_RESULT() == 0 && drvR.SG_RESULT() == 0)) {
-      err = ERR_MOTOR_STUCK;
-    }
-  }
-  g_error = err;
+  static uint8_t discCnt = 0, stuckCnt = 0;
+  bool moving = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
+  bool driving = g_motorsOn && moving;
+
+  // Snapshot StallGuard load + open-load/overtemp flags for the heartbeat and tuning.
+  g_sgL = drvL.SG_RESULT();
+  g_sgR = drvR.SG_RESULT();
+  g_drvStat = (driving && drvL.ola() ? 0x01 : 0) | (driving && drvL.olb() ? 0x02 : 0) |
+              (driving && drvR.ola() ? 0x04 : 0) | (driving && drvR.olb() ? 0x08 : 0) |
+              (drvL.ot() ? 0x10 : 0) | (drvR.ot() ? 0x20 : 0);
+
+  bool commsBad = (drvL.test_connection() != 0) || (drvR.test_connection() != 0);
+  bool openLoad = driving && (g_drvStat & 0x0F);       // a coil open while being driven
+  bool disc     = commsBad || openLoad;
+
+  // Stuck: commanded to move but StallGuard load collapses (rotor physically held).
+  // Off by default (STALL_SG_MIN==0) until tuned against the real rig — see the #define.
+  bool stuck = (STALL_SG_MIN > 0) && driving && !disc &&
+               ((g_sgL < STALL_SG_MIN) || (g_sgR < STALL_SG_MIN));
+
+  discCnt  = disc  ? (uint8_t)(discCnt  + 1) : 0;
+  stuckCnt = stuck ? (uint8_t)(stuckCnt + 1) : 0;
+
+  if      (discCnt  >= FAULT_DEBOUNCE) g_error = ERR_MOTOR_DISCONNECTED;
+  else if (stuckCnt >= FAULT_DEBOUNCE) g_error = ERR_MOTOR_STUCK;
+  else if (!disc && !stuck)            g_error = ERR_NONE;
 }
 
-// ----------------------------- Homing ---------------------------------------
+// ----------------------------- Homing / deferred stop ------------------------
 static void serviceHoming() {
   if (g_homingStop && g_homeSeen) {
     g_homingStop = false;
-    wheelsStop();
-    // Let the ramp-down finish, then cut power to hold position passively.
+    wheelsStop();            // decelerate on the ramp
+    g_stopDisable = true;    // ...then cut power once actually stopped (below)
+  }
+  // Deferred power-down shared by CMD_STOP and homing: wait for the deceleration ramp to
+  // finish before disabling the driver, so stops are smooth instead of an instant chop.
+  if (g_stopDisable && !((stepL && stepL->isRunning()) || (stepR && stepR->isRunning()))) {
+    g_stopDisable = false;
     motorsEnable(false);
   }
 }
@@ -374,14 +408,15 @@ static void serviceButton() {
     lastEdge = millis();
     g_selfTest = true;
     g_selfTestEndMs = millis() + 5000;
-    motorsEnable(true);
-    spinSet(60);
+    motorsEnable(true);                 // jog both wheels slowly + light: a lone-cart self-test
+    wheelRun(stepL, drvL, 60);
+    wheelRun(stepR, drvR, 60);
     lightSet(true);
   }
   if (g_selfTest && millis() > g_selfTestEndMs) {
     g_selfTest = false;
-    spinSet(0);
-    motorsEnable(false);
+    wheelsStop();
+    g_stopDisable = true;
     lightSet(false);
   }
 }
@@ -464,11 +499,12 @@ void loop() {
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
     bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
-                  "TMC:%s I=%umA usteps=%u | cmd L=%.0f R=%.0f spin=%.0f rpm | light=%d motors=%d\n",
+                  "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | cmd L=%.0f R=%.0f rpm | "
+                  "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
-                  errText(g_error), g_currentMa, g_microsteps,
-                  g_cmdWheelL, g_cmdWheelR, g_cmdSpin,
+                  errText(g_error), g_currentMa, g_microsteps, g_stepDegree,
+                  g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
                   g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }

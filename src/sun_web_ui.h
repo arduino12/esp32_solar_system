@@ -50,9 +50,9 @@ fieldset{border:1px solid var(--edge);border-radius:8px;margin:8px 0;padding:8px
 legend{color:var(--acc);font-size:13px;text-transform:capitalize}
 .f{display:flex;align-items:center;gap:8px;margin:4px 0}
 .f label{flex:0 0 46%;color:var(--mut);font-size:13px}
-input{background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px;font:inherit}
-input:focus{outline:none;border-color:var(--acc)}
-.f input{flex:1}
+input,select{background:#0d1017;border:1px solid var(--edge);color:var(--tx);border-radius:6px;padding:6px 8px;font:inherit}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+.f input,.f select{flex:1}
 .arr{display:flex;gap:6px;flex-wrap:wrap}.arr input{width:64px;flex:0 0 auto;padding:6px 4px;text-align:center}
 .foot{text-align:center;color:var(--mut);font-size:12px;margin-top:22px}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1f6feb;color:#fff;
@@ -203,7 +203,20 @@ function mkInput(v,path){
   inp.onchange=()=>setPath(cfg,path,inp.type==='number'?parseFloat(inp.value):inp.value)}
  return inp;
 }
+const MICROSTEPS=[1,2,4,8,16,32,64,128,256];
+function mkSelect(v,path,opts){                 // restrict a value to a fixed option set
+ const sel=document.createElement('select');
+ opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
+  if(+o===+v)op.selected=true;sel.appendChild(op)});
+ sel.onchange=()=>setPath(cfg,path,parseInt(sel.value));
+ return sel;
+}
 function render(key,val,path){
+ if(key==='microsteps'&&!Array.isArray(val)&&typeof val!=='object'){
+  const f=document.createElement('div');f.className='f';
+  const l=document.createElement('label');l.textContent=key;
+  f.appendChild(l);f.appendChild(mkSelect(val,path,MICROSTEPS));return f;
+ }
  if(key==='mac_address'&&Array.isArray(val)){   // one labelled line per planet
   const fs=document.createElement('fieldset');const lg=document.createElement('legend');
   lg.textContent=key;fs.appendChild(lg);
