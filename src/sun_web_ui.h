@@ -32,6 +32,15 @@ button:active{transform:translateY(1px)}
 .mode{font-size:14px;color:var(--mut)}
 .timer{font-size:46px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;margin:6px 0}
 svg{display:block;width:100%;max-width:400px;margin:0 auto}
+.ptab{width:100%;border-collapse:collapse;margin-top:12px;font:12px ui-monospace,Consolas,monospace}
+.ptab th{color:var(--mut);text-align:right;font-weight:600;padding:3px 6px;border-bottom:1px solid var(--edge)}
+.ptab th:first-child{text-align:left}
+.ptab td{padding:3px 6px;text-align:right;border-bottom:1px solid var(--edge);color:var(--tx)}
+.ptab td:first-child{text-align:left;color:var(--mut)}
+.ptab tr.off td{color:#4a5568}
+.ptab .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.ptab .hot{color:var(--red);font-weight:700}
+.ptab .er{color:var(--red)}
 .stats{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:12px}
 .stat b{display:block;font-size:30px}
 .stat span{color:var(--mut);font-size:13px}
@@ -68,6 +77,8 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="mode" id="mode">--</div>
 <div class="timer" id="timer">00:00:00</div>
 <svg viewBox="0 0 400 400" id="sky"></svg>
+<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Fault</th></tr></thead>
+<tbody id="ptab"></tbody></table>
 <div id="log"></div>
 </div>
 
@@ -163,11 +174,21 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
  if(d.net){setLink($('#n_sta'),d.net.sta_ip,'not connected');
   $('#n_ap').textContent=d.net.ap_ip||'--';
   setLink($('#n_mdns'),d.net.mdns,'--');}
+ const ERRTXT=['','motor disconnected','motor stuck'];let rows='';
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
   p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
   if(pl.home_count!==p.homeCount){p.homeCount=pl.home_count;if(p.homeCount>0)p.angle=p.homeDeg}
+  const state=pl.online?'online':(pl.configured?'offline':'—');
+  const dot='<span class="dot" style="background:'+(pl.online?COLORS[i]:'#3b4557')+'"></span>';
+  const sig=pl.online?(pl.rssi_pct+'% ('+pl.rssi+')'):'—';
+  const tc=pl.online?pl.temp_c:null;
+  const temp=tc==null?'—':('<span class="'+(tc>=70?'hot':'')+'">'+tc+'&deg;C</span>');
+  const fault=pl.error?('<span class="er">'+(ERRTXT[pl.error]||('err '+pl.error))+'</span>'):(pl.online?'ok':'—');
+  rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
+   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+fault+'</td></tr>';
  });
+ $('#ptab').innerHTML=rows;
  $('#log').textContent=(d.log||[]).join('\n');
 }).catch(()=>{})}
 

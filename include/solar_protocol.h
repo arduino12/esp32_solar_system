@@ -62,6 +62,8 @@ struct __attribute__((packed)) StatusMsg {
   uint8_t  error;         // PlanetErr
   uint8_t  light_on;      // current light state
   uint8_t  moving;        // 1 if any wheel motor is currently running
+  int8_t   temp_c;        // ESP32-C3 internal die temperature, °C (INT8_MIN = unknown)
+  int8_t   rssi;          // last measured Sun-AP signal, dBm (0 = unknown)
 };
 
 #define PLANET_INDEX_UNKNOWN 0xFF

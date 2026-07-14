@@ -26,10 +26,10 @@
 
 // ----------------------------- Pin map (from spec) --------------------------
 static const uint8_t PIN_TMC_EN     = 2;   // TMC enable, active-low (LOW = drivers on)
-static const uint8_t PIN_TMC_RX     = 0;   // Serial1 RX  <- driver PDN/UART bus
-static const uint8_t PIN_TMC_TX     = 1;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
-static const uint8_t PIN_STEP_L     = 3;   // left  wheel step
-static const uint8_t PIN_STEP_R     = 4;   // right wheel step
+static const uint8_t PIN_TMC_RX     = 4;   // Serial1 RX  <- driver PDN/UART bus
+static const uint8_t PIN_TMC_TX     = 3;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
+static const uint8_t PIN_STEP_L     = 0;   // left  wheel step
+static const uint8_t PIN_STEP_R     = 1;   // right wheel step
 static const uint8_t PIN_STEP_P     = 5;   // planet-spin step (only used in LEDC fallback)
 static const uint8_t PIN_HOME       = 6;   // homing sensor, active-low, FALLING pulse/rev
 static const uint8_t PIN_LIGHT_EN   = 7;   // N-MOS gate for planet light
@@ -40,13 +40,22 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define USE_VACTUAL_SPIN   1               // 1: spin ball via TMC VACTUAL; 0: LEDC PWM on PIN_STEP_P
 #define TMC_R_SENSE        0.11f
 #define TMC_UART_BAUD      115200
-#define TMC_ADDR_L         0b00            // MS1=GND MS2=GND
-#define TMC_ADDR_R         0b01            // MS1=VIO MS2=GND
-#define TMC_ADDR_P         0b10            // MS1=GND MS2=VIO
+#define TMC_ADDR_L         0b11            // MS1=VIO MS2=VIO
+#define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
+#define TMC_ADDR_P         0b00            // MS1=GND MS2=GND
 #define MOTOR_FULL_STEPS   200             // 1.8 deg/step
 #define WHEEL_ACCEL_RPM_S  300.0f          // wheel acceleration ramp (rpm per second)
 #define LEDC_SPIN_CH       0               // LEDC channel for spin fallback
 #define LEDC_SPIN_RES      8               // LEDC resolution bits
+
+// ----------------------------- Radio / power --------------------------------
+// The C3 runs warm because its Wi-Fi radio is always on for ESP-NOW. Two levers reduce it:
+//  - Lower the max TX power: 44 = 11 dBm (vs the 84/21 dBm default). Ample for a room-scale
+//    installation and noticeably cooler / lower current. Raise if range is a problem.
+//  - Rescan for the Sun's channel less often while OFFLINE (active scans are the biggest
+//    periodic radio burst on an otherwise idle cart).
+#define WIFI_TX_POWER_QDBM 44
+#define OFFLINE_RESCAN_MS  10000
 
 // Boot defaults (overwritten by the first command from the Sun).
 static uint16_t g_currentMa  = 1000;       // current_amp=1.0
@@ -70,6 +79,15 @@ static bool     g_motorsOn    = false;     // wheels/spin enabled
 static bool     g_lightOn     = false;
 static bool     g_homingStop  = false;     // true while executing CMD_HOME_AND_STOP
 static uint8_t  g_error       = ERR_NONE;
+
+// Last commanded motion (for status/debug; the cart is a dumb executor of the Sun's numbers).
+static float    g_cmdWheelL   = 0;
+static float    g_cmdWheelR   = 0;
+static float    g_cmdSpin     = 0;
+
+// Diagnostics reported back to the Sun and printed in the heartbeat.
+static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
+static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
 
 static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
 static uint32_t g_nextStatusMs = 0;        // next scheduled status transmit
@@ -97,6 +115,26 @@ void IRAM_ATTR homeIsr() {
 }
 
 // ----------------------------- Helpers --------------------------------------
+// Wi-Fi signal as a friendly 0-100%: -100 dBm -> 0%, -50 dBm or better -> 100%.
+static inline uint8_t rssiPct(int8_t rssi) {
+  if (rssi == 0) return 0;                       // unknown
+  int p = 2 * (rssi + 100);
+  return (uint8_t)constrain(p, 0, 100);
+}
+
+static const char *errText(uint8_t e) {
+  switch (e) {
+    case ERR_MOTOR_DISCONNECTED: return "MOTOR_DISCONNECTED";
+    case ERR_MOTOR_STUCK:        return "MOTOR_STUCK";
+    default:                     return "OK";
+  }
+}
+
+// ESP32-C3 built-in temperature sensor (die temp; reads ~10-20 °C above ambient from self-heat).
+static float readDieTempC() {
+  return temperatureRead();
+}
+
 static inline uint32_t rpmToStepsHz(float rpm) {
   // |rpm| -> microsteps per second
   return (uint32_t)((fabsf(rpm) / 60.0f) * (float)MOTOR_FULL_STEPS * (float)g_microsteps);
@@ -207,6 +245,7 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   switch (m.command) {
     case CMD_STOP:
       g_homingStop = false;
+      g_cmdWheelL = 0; g_cmdWheelR = 0; g_cmdSpin = 0;
       wheelsStop(); spinSet(0);
       motorsEnable(false);
       lightSet(false);
@@ -214,6 +253,7 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
     case CMD_RUN:
       g_homingStop = false;
+      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm; g_cmdSpin = m.spin_rpm;
       motorsEnable(true);
       wheelRun(stepL, drvL, m.wheel_l_rpm);
       wheelRun(stepR, drvR, m.wheel_r_rpm);
@@ -225,6 +265,7 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
       // Drive both wheels slowly toward HOME; homing logic stops on the pulse.
       g_homingStop = true;
       g_homeSeen   = false;
+      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm; g_cmdSpin = 0;
       motorsEnable(true);
       wheelRun(stepL, drvL, m.wheel_l_rpm);
       wheelRun(stepR, drvR, m.wheel_r_rpm);
@@ -247,6 +288,9 @@ static void sendStatus() {
   s.error        = g_error;
   s.light_on     = g_lightOn ? 1 : 0;
   s.moving       = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
+  g_dieTempC     = readDieTempC();
+  s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
+  s.rssi         = g_sunRssi;
   g_homePulse    = false;
 
   const uint8_t *dst = g_sunKnown ? g_sunMac : BCAST_MAC;
@@ -259,7 +303,11 @@ static bool discoverChannel() {
   int n = WiFi.scanNetworks(false, true);
   int ch = -1;
   for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == SOLAR_AP_SSID_DEFAULT) { ch = WiFi.channel(i); break; }
+    if (WiFi.SSID(i) == SOLAR_AP_SSID_DEFAULT) {
+      ch = WiFi.channel(i);
+      g_sunRssi = (int8_t)WiFi.RSSI(i);   // record link quality to the Sun's AP
+      break;
+    }
   }
   WiFi.scanDelete();
   if (ch < 0) return false;
@@ -366,6 +414,7 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);   // run the radio cooler (see notes above)
   Serial.print("Planet MAC: ");
   Serial.println(WiFi.macAddress());     // provision this into the Sun's mac_address[]
 
@@ -403,7 +452,7 @@ void loop() {
 
   // While offline, periodically re-scan for the Sun's channel (it may move when the Sun's
   // STA connects to a router and drags the SoftAP to a new channel).
-  if (g_state == ST_OFFLINE && now - g_channelScanMs > 5000) {
+  if (g_state == ST_OFFLINE && now - g_channelScanMs > OFFLINE_RESCAN_MS) {
     g_channelScanMs = now;
     discoverChannel();
   }
@@ -411,9 +460,15 @@ void loop() {
   // Debug heartbeat: always emit something so a late-connecting monitor sees the cart is alive.
   if (now - g_lastDbgMs > 2000) {
     g_lastDbgMs = now;
+    g_dieTempC = readDieTempC();
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
-    Serial.printf("[%lus] %s  sun=%d idx=%u err=%u light=%d motors=%d\n",
-                  (unsigned long)(now / 1000), st, g_sunKnown ? 1 : 0,
-                  g_myIndex, g_error, g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
+    bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
+    Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
+                  "TMC:%s I=%umA usteps=%u | cmd L=%.0f R=%.0f spin=%.0f rpm | light=%d motors=%d\n",
+                  (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
+                  rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
+                  errText(g_error), g_currentMa, g_microsteps,
+                  g_cmdWheelL, g_cmdWheelR, g_cmdSpin,
+                  g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }

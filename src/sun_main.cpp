@@ -96,6 +96,8 @@ struct PlanetState {
   bool     moving;
   uint32_t homeCount;     // increments each reported HOME pulse
   float    orbitalRpm;    // signed; Sun-computed for the web animation
+  int8_t   tempC;         // planet die temperature, °C (reported by the cart)
+  int8_t   rssi;          // planet<->Sun signal, dBm (reported by the cart)
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
 
@@ -229,6 +231,8 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   p.lastSeenMs = millis();
   p.lightOn    = s.light_on;
   p.moving     = s.moving;
+  p.tempC      = s.temp_c;
+  p.rssi       = s.rssi;
   if (s.home_pulsed) p.homeCount++;
   if (s.error != p.error && s.error != ERR_NONE)
     addLog("Planet " + String(idx) + (s.error == ERR_MOTOR_DISCONNECTED ? " motor disconnected"
@@ -539,6 +543,12 @@ static void buildStatusJson(String &out) {
     o["orbital_rpm"] = g_planet[i].orbitalRpm;
     o["home_count"]  = g_planet[i].homeCount;
     o["home_deg"]    = (i % 2 == 0) ? 180 : 0;   // home line spread horizontally (L/R)
+    if (online) {
+      o["temp_c"]   = g_planet[i].tempC;
+      int r = g_planet[i].rssi;
+      o["rssi"]     = r;
+      o["rssi_pct"] = r ? constrain(2 * (r + 100), 0, 100) : 0;   // -100dBm=0%, -50dBm=100%
+    }
   }
 
   JsonObject net = d["net"].to<JsonObject>();
