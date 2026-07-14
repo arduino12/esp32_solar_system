@@ -169,6 +169,24 @@ static void loadSettings() {
   }
 }
 
+static void saveSettings() {
+  File f = LittleFS.open("/settings.json", "w");
+  if (!f) return;
+  serializeJson(g_settings, f);
+  f.close();
+}
+
+// Drop keys belonging to removed features so an old saved file doesn't keep resurfacing them in
+// the web form. Runs once at boot and rewrites the file only if something changed.
+static void migrateSettings() {
+  JsonObject planets = g_settings["planets"].as<JsonObject>();
+  if (!planets.isNull() && !planets["axial_rotation_speed_rpm"].isNull()) {
+    planets.remove("axial_rotation_speed_rpm");
+    saveSettings();
+    Serial.println("Migrated settings: removed obsolete axial_rotation_speed_rpm");
+  }
+}
+
 static void saveStats();   // fwd
 
 static void loadStats() {
@@ -590,6 +608,12 @@ static void setupWeb() {
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
+  // Restore settings.json to defaults (same as a 5 s BOOT-button hold); applied in loop().
+  server.on("/api/settings/reset", HTTP_POST, [](AsyncWebServerRequest *req) {
+    g_doFactoryReset = true;
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
   // POST /api/settings — JSON body replaces settings.json; applied in loop().
   auto *settingsPost = new AsyncCallbackJsonWebHandler(
       "/api/settings", [](AsyncWebServerRequest *req, JsonVariant &json) {
@@ -654,6 +678,7 @@ void setup() {
 
   if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
   loadSettings();
+  migrateSettings();
   loadStats();
   parseMacs();
 

@@ -30,6 +30,9 @@ static const uint8_t PIN_TMC_RX     = 4;   // Serial1 RX  <- driver PDN/UART bus
 static const uint8_t PIN_TMC_TX     = 3;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
 static const uint8_t PIN_STEP_L     = 0;   // left  wheel step
 static const uint8_t PIN_STEP_R     = 1;   // right wheel step
+static const uint8_t PIN_MOTOR_PWR  = 5;   // (freed by dropping the spin motor) drives a high-side
+                                           // MOSFET / load switch feeding VM to the TMC drivers.
+                                           // HIGH = motor supply on; LOW = drivers fully asleep.
 static const uint8_t PIN_HOME       = 6;   // homing sensor, active-low, FALLING pulse/rev
 static const uint8_t PIN_LIGHT_EN   = 7;   // N-MOS gate for planet light
 static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
@@ -42,6 +45,14 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
 #define WHEEL_ACCEL_RPM_S  50.0f           // wheel accel/decel ramp (rpm per second) — gentle
                                            // start/stop: 0->300 rpm takes ~6 s.
+#define WHEEL_R_INVERT     true            // wheels are mounted back-to-back: flip the right one
+                                           // so a "forward" command rolls both the same way.
+// FastAccelStepper on the ESP32-C3 can emit at most 200 kHz of step pulses (RMT hard limit).
+// If (rpm x steps/rev x microsteps) exceeds this the speed command is rejected and the motor
+// barely turns, which looks like "microsteps changes speed". We keep a small margin and, rather
+// than let RPM drop, automatically reduce the *effective* microstepping so the commanded RPM is
+// always reached (see fitMicrosteps). Smoothness is traded only when physically unavoidable.
+#define WHEEL_MAX_STEP_HZ  190000UL
 // StallGuard load below this while a wheel is commanded to move = mechanically stuck.
 // TMC2209 StallGuard needs per-rig tuning; watch sgL/sgR in the serial heartbeat and set this
 // a little above the "held" reading but below the free-running reading. 0 disables the check.
@@ -158,6 +169,16 @@ static uint8_t sanitizeMicrosteps(uint8_t m) {
   return best;
 }
 
+// Largest valid microstep setting (<= requested) whose step-pulse rate at |rpm| stays under the
+// C3's ceiling, so the commanded RPM is always achievable and independent of the microstep choice.
+static uint8_t fitMicrosteps(uint8_t requested, float rpm) {
+  float fullStepsPerRev = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
+  float stepsPerSec1x   = (fabsf(rpm) / 60.0f) * fullStepsPerRev;   // pulse rate at 1x microstep
+  uint8_t us = requested;
+  while (us > 1 && stepsPerSec1x * (float)us > (float)WHEEL_MAX_STEP_HZ) us >>= 1;
+  return us;
+}
+
 static void applyDriverParams() {
   // Re-apply current/microsteps to both wheel drivers (called at boot and on every command
   // that changes them). Mirrors the bring-up sequence used in rotating_rods_skr_pico, plus
@@ -187,13 +208,24 @@ static void tmcBringup() {
   applyDriverParams();
 }
 
-// Enable/disable the driver power stage. Beyond the EN pin we also gate the chopper (toff):
-// with toff=0 the output MOSFETs are off, so a disabled driver draws only chip quiescent
-// current and stays cool. Planets are idle most of the time, so this is the dominant saving.
+// Enable/disable the drivers. Three levers, strongest first:
+//   1. PIN_MOTOR_PWR cuts the motor supply (VM) to the drivers entirely when idle — true sleep,
+//      ~zero driver draw. VCC_IO stays powered from 3.3V, so the TMC register config survives
+//      the VM power-cycle and needs no re-init on wake.
+//   2. EN pin high disables the output stage.
+//   3. toff=0 gates the chopper off.
+// Planets are idle the vast majority of the time, so this is where the standby current goes.
 static void motorsEnable(bool on) {
-  if (on) { drvL.toff(4); drvR.toff(4); }
-  digitalWrite(PIN_TMC_EN, on ? LOW : HIGH);  // active-low
-  if (!on) { drvL.toff(0); drvR.toff(0); }
+  if (on) {
+    digitalWrite(PIN_MOTOR_PWR, HIGH);          // wake: motor supply on
+    delayMicroseconds(1500);                    // let VM settle before driving
+    drvL.toff(4); drvR.toff(4);                 // re-assert chopper
+    digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
+  } else {
+    digitalWrite(PIN_TMC_EN, HIGH);             // disable outputs
+    drvL.toff(0); drvR.toff(0);                 // chopper off
+    digitalWrite(PIN_MOTOR_PWR, LOW);           // sleep: cut motor supply
+  }
   g_motorsOn = on;
 }
 
@@ -204,11 +236,12 @@ static void lightSet(bool on) {
 
 // Continuous wheel rotation at a signed rpm. Direction handled via the TMC shaft bit
 // because the DIR pins are tied to GND; FastAccelStepper only produces step pulses.
-static void wheelRun(FastAccelStepper *st, TMC2209Stepper &drv, float rpm) {
+static void wheelRun(FastAccelStepper *st, TMC2209Stepper &drv, float rpm, bool invert) {
   if (!st) return;
   if (fabsf(rpm) < 0.01f) { st->stopMove(); return; }
-  drv.shaft(rpm < 0);
+  drv.shaft((rpm < 0) ^ invert);        // back-to-back mount: right wheel spins the other way
   uint32_t hz    = rpmToStepsHz(rpm);
+  if (hz > WHEEL_MAX_STEP_HZ) hz = WHEEL_MAX_STEP_HZ;   // safety clamp under the RMT ceiling
   uint32_t accel = rpmToStepsHz(WHEEL_ACCEL_RPM_S);
   st->setSpeedInHz(hz > 0 ? hz : 1);
   st->setAcceleration(accel > 0 ? accel : 1);
@@ -246,13 +279,21 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
     addPeer(g_sunMac);
   }
 
-  // Apply driver parameters if they changed. Microsteps is snapped to a valid TMC value so the
-  // pulse rate and the driver divisor always agree (otherwise RPM would shift with microsteps).
-  uint8_t us = sanitizeMicrosteps(m.microsteps);
-  if (m.current_ma != g_currentMa || us != g_microsteps || fabsf(m.step_degree - g_stepDegree) > 0.001f) {
+  // Step angle first (the microstep cap below depends on it).
+  if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
+
+  // Effective microsteps: snap to a valid TMC value, then cap it so the pulse rate for the
+  // fastest commanded wheel stays under the C3's step-rate ceiling. This keeps the commanded
+  // RPM independent of the microstep setting instead of stalling out at high microsteps.
+  uint8_t reqUs = sanitizeMicrosteps(m.microsteps);
+  float   maxRpm = fmaxf(fabsf(m.wheel_l_rpm), fabsf(m.wheel_r_rpm));
+  uint8_t effUs  = (maxRpm > 0.1f) ? fitMicrosteps(reqUs, maxRpm) : reqUs;
+  if (m.current_ma != g_currentMa || effUs != g_microsteps) {
+    if (effUs != reqUs)
+      Serial.printf("microsteps %u->%u (capped to hold %.0f rpm under %lu Hz)\n",
+                    reqUs, effUs, maxRpm, (unsigned long)WHEEL_MAX_STEP_HZ);
     g_currentMa  = m.current_ma;
-    g_microsteps = us;
-    if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
+    g_microsteps = effUs;
     applyDriverParams();
   }
 
@@ -269,8 +310,8 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
       g_homingStop = false; g_stopDisable = false;
       g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
       motorsEnable(true);
-      wheelRun(stepL, drvL, m.wheel_l_rpm);
-      wheelRun(stepR, drvR, m.wheel_r_rpm);
+      wheelRun(stepL, drvL, m.wheel_l_rpm, false);
+      wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
       lightSet(m.light_on);
       break;
 
@@ -280,8 +321,8 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
       g_homeSeen   = false;
       g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
       motorsEnable(true);
-      wheelRun(stepL, drvL, m.wheel_l_rpm);
-      wheelRun(stepR, drvR, m.wheel_r_rpm);
+      wheelRun(stepL, drvL, m.wheel_l_rpm, false);
+      wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
       lightSet(m.light_on);
       break;
 
@@ -358,6 +399,10 @@ static void serviceFaults() {
   g_lastFaultMs = millis();
 
   static uint8_t discCnt = 0, stuckCnt = 0;
+  if (!g_motorsOn) {                     // drivers asleep (VM may be cut): nothing valid to read
+    g_error = ERR_NONE; g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = stuckCnt = 0;
+    return;
+  }
   bool moving = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
   bool driving = g_motorsOn && moving;
 
@@ -409,8 +454,8 @@ static void serviceButton() {
     g_selfTest = true;
     g_selfTestEndMs = millis() + 5000;
     motorsEnable(true);                 // jog both wheels slowly + light: a lone-cart self-test
-    wheelRun(stepL, drvL, 60);
-    wheelRun(stepR, drvR, 60);
+    wheelRun(stepL, drvL, 60, false);
+    wheelRun(stepR, drvR, 60, WHEEL_R_INVERT);
     lightSet(true);
   }
   if (g_selfTest && millis() > g_selfTestEndMs) {
@@ -440,6 +485,7 @@ void setup() {
   delay(300);
   Serial.println("\n==== Solar System - PLANET boot ====");
 
+  pinMode(PIN_MOTOR_PWR, OUTPUT);  digitalWrite(PIN_MOTOR_PWR, LOW);  // motor supply asleep
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
   pinMode(PIN_LIGHT_EN, OUTPUT);   digitalWrite(PIN_LIGHT_EN, LOW);
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);

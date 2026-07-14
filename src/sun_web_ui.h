@@ -95,6 +95,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div id="settings"></div>
 <div class="row" style="margin-top:10px">
 <button class="b-start" onclick="saveCfg()">Save &amp; apply</button>
+<button class="b-stop" onclick="resetCfg()">Restore defaults</button>
 </div></div>
 
 <div class="foot">By Didi, Arad and Calude 2026</div>
@@ -247,6 +248,8 @@ function loadCfg(){fetch('/api/settings').then(r=>r.json()).then(d=>{cfg=d;
  for(const k in d)box.appendChild(render(k,d[k],[k]));})}
 function saveCfg(){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
  body:JSON.stringify(cfg)}).then(()=>{toast('saved');setTimeout(loadCfg,300)})}
+function resetCfg(){if(confirm('Restore ALL settings to factory defaults? This also clears the planet MAC addresses.'))
+ fetch('/api/settings/reset',{method:'POST'}).then(()=>{toast('defaults restored');setTimeout(loadCfg,700)})}
 
 buildSky();loadStats();loadCfg();poll();setInterval(poll,1000);setInterval(loadStats,5000);
 </script></body></html>)HTML";
