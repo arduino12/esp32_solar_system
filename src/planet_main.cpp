@@ -11,16 +11,19 @@
 //
 // Motors: 2x TMC2209 on one single-wire UART bus (addresses 0/1). The planets do NOT spin
 // about their own axis (that motor was dropped) — they only roll around the rail and light up.
-//   - Left wheel  (outer rail track) -> FastAccelStepper step pulses (RMT), dir via UART shaft bit
-//   - Right wheel (inner rail track) -> FastAccelStepper step pulses (RMT), dir via UART shaft bit
-// DIR pins are tied to GND in hardware; direction is set over UART, so only 2 RMT channels
-// (both wheels) are needed — which is exactly what the C3 provides.
+//
+// Wheel drive uses the TMC2209's built-in constant-velocity generator (VACTUAL register) over
+// UART, NOT MCU-generated STEP pulses. On the single-core ESP32-C3, FastAccelStepper's RMT step
+// ISR is starved by the always-on Wi-Fi/ESP-NOW radio, which intermittently wedges the step
+// generator on restart (motor freezes mid-ramp until reboot). VACTUAL sidesteps that entirely:
+// the driver spins the motor from its own internal clock, so start/stop/restart is just a
+// register write and there is no 200 kHz step-rate ceiling (any microstep setting works). We
+// ramp VACTUAL up/down in software (serviceRamp) to get smooth ~1 s accel/decel.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <FastAccelStepper.h>
 #include <TMCStepper.h>
 #include "solar_protocol.h"
 
@@ -28,8 +31,8 @@
 static const uint8_t PIN_TMC_EN     = 2;   // TMC enable, active-low (LOW = drivers on)
 static const uint8_t PIN_TMC_RX     = 4;   // Serial1 RX  <- driver PDN/UART bus
 static const uint8_t PIN_TMC_TX     = 3;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
-static const uint8_t PIN_STEP_L     = 0;   // left  wheel step
-static const uint8_t PIN_STEP_R     = 1;   // right wheel step
+static const uint8_t PIN_STEP_L     = 0;   // (unused with VACTUAL; STEP is generated inside TMC)
+static const uint8_t PIN_STEP_R     = 1;   // (unused with VACTUAL)
 static const uint8_t PIN_MOTOR_PWR  = 5;   // (freed by dropping the spin motor) drives a high-side
                                            // MOSFET / load switch feeding VM to the TMC drivers.
                                            // HIGH = motor supply on; LOW = drivers fully asleep.
@@ -43,16 +46,15 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define TMC_UART_BAUD      115200
 #define TMC_ADDR_L         0b11            // MS1=VIO MS2=VIO
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
-#define WHEEL_ACCEL_RPM_S  50.0f           // wheel accel/decel ramp (rpm per second) — gentle
-                                           // start/stop: 0->300 rpm takes ~6 s.
 #define WHEEL_R_INVERT     true            // wheels are mounted back-to-back: flip the right one
                                            // so a "forward" command rolls both the same way.
-// FastAccelStepper on the ESP32-C3 can emit at most 200 kHz of step pulses (RMT hard limit).
-// If (rpm x steps/rev x microsteps) exceeds this the speed command is rejected and the motor
-// barely turns, which looks like "microsteps changes speed". We keep a small margin and, rather
-// than let RPM drop, automatically reduce the *effective* microstepping so the commanded RPM is
-// always reached (see fitMicrosteps). Smoothness is traded only when physically unavoidable.
-#define WHEEL_MAX_STEP_HZ  190000UL
+// TMC2209 internal oscillator (datasheet typical 12 MHz). VACTUAL speed:
+//   v[µsteps/s] = VACTUAL * fCLK / 2^24  ->  VACTUAL = v * 2^24 / fCLK.
+// If measured RPM is a few % off, trim TMC_FCLK (the internal clock varies part to part).
+#define TMC_FCLK           12000000.0f
+#define VACTUAL_PER_HZ     (16777216.0f / TMC_FCLK)   // µsteps/s -> VACTUAL register units
+#define WHEEL_RAMP_S       1.0f            // seconds to accelerate 0->commanded speed (and back)
+#define VACTUAL_UPDATE_MS  20              // how often the software ramp pushes VACTUAL over UART
 // StallGuard load below this while a wheel is commanded to move = mechanically stuck.
 // TMC2209 StallGuard needs per-rig tuning; watch sgL/sgR in the serial heartbeat and set this
 // a little above the "held" reading but below the free-running reading. 0 disables the check.
@@ -77,26 +79,31 @@ HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
 TMC2209Stepper   drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
 
-FastAccelStepperEngine engine = FastAccelStepperEngine();
-FastAccelStepper *stepL = nullptr;
-FastAccelStepper *stepR = nullptr;
-
 // ----------------------------- Runtime state --------------------------------
 enum PlanetState : uint8_t { ST_OFFLINE, ST_IDLE, ST_ACTIVE };
 static PlanetState g_state = ST_OFFLINE;
 
 static uint8_t  g_myIndex     = PLANET_INDEX_UNKNOWN;
-static bool     g_motorsOn    = false;     // wheels/spin enabled
+static bool     g_motorsOn    = false;     // drivers enabled (VM on, EN low)
 static bool     g_lightOn     = false;
 static bool     g_homingStop  = false;     // true while executing CMD_HOME_AND_STOP
 static uint8_t  g_error       = ERR_NONE;
 
-// Last commanded motion (for status/debug; the cart is a dumb executor of the Sun's numbers).
-static float    g_cmdWheelL   = 0;
+// Wheel velocity ramp (µsteps/s, signed = direction). serviceRamp() moves cur toward tgt at
+// g_rampRate and pushes the matching VACTUAL to each driver.
+static float    g_cmdWheelL   = 0;         // last commanded wheel rpm (for status/debug)
 static float    g_cmdWheelR   = 0;
-static bool     g_stopDisable = false;     // decelerate first, cut driver power once stopped
-static uint32_t g_stopProgMs  = 0;         // last time step position advanced while stopping
-static int32_t  g_stopLastPos = 0;         // step position snapshot for stall detection
+static float    g_velCurL = 0, g_velCurR = 0;   // current wheel velocity, µsteps/s
+static float    g_velTgtL = 0, g_velTgtR = 0;   // target  wheel velocity, µsteps/s
+static float    g_rampRate    = 1000.0f;   // µsteps/s^2, recomputed whenever a target is set
+static uint32_t g_rampMs      = 0;         // last ramp tick
+
+// Deferred actions triggered when the wheels have ramped to a stop.
+static bool     g_stopThenOff   = false;   // ramp to 0, then disable the drivers (CMD_STOP/homing)
+static bool     g_resumePending = false;   // ramp to 0, change microsteps, then ramp back up
+static float    g_pendingRpmL = 0, g_pendingRpmR = 0;   // rpm to resume with after a microstep change
+static uint8_t  g_pendingMicro  = 16;
+static uint16_t g_pendingCurrent = 200;
 
 // Diagnostics reported back to the Sun and printed in the heartbeat.
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
@@ -137,17 +144,6 @@ static inline uint8_t rssiPct(int8_t rssi) {
   return (uint8_t)constrain(p, 0, 100);
 }
 
-// Decode a FastAccelStepper rampState() bitfield to a short word for the heartbeat.
-static const char *rampText(uint8_t rs) {
-  switch (rs & RAMP_STATE_MASK) {
-    case RAMP_STATE_COAST:      return "COAST";   // at target speed (constant)
-    case RAMP_STATE_ACCELERATE: return "ACCEL";   // ramping up
-    case RAMP_STATE_DECELERATE: return "DECEL";   // ramping down
-    case RAMP_STATE_REVERSE:    return "REVERSE";
-    default:                    return "idle";
-  }
-}
-
 static const char *errText(uint8_t e) {
   switch (e) {
     case ERR_MOTOR_DISCONNECTED: return "MOTOR_DISCONNECTED";
@@ -161,17 +157,15 @@ static float readDieTempC() {
   return temperatureRead();
 }
 
-static inline uint32_t rpmToStepsHz(float rpm) {
-  // |rpm| -> microsteps per second. Speed is fully defined by RPM and the step angle
-  // (360/step_degree full steps per rev); microsteps scales the pulse rate AND the driver's
-  // divisor equally, so the resulting shaft RPM is independent of the microstep setting.
+// Signed wheel speed in µsteps/s for a given rpm. Speed is fully defined by rpm and the step
+// angle; microsteps scales both the µstep rate and the driver divisor, so shaft RPM is
+// independent of the microstep setting.
+static float rpmToUstepsHz(float rpm) {
   float fullStepsPerRev = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
-  return (uint32_t)((fabsf(rpm) / 60.0f) * fullStepsPerRev * (float)g_microsteps);
+  return (rpm / 60.0f) * fullStepsPerRev * (float)g_microsteps;
 }
 
-// Round an arbitrary microstep request to the nearest valid TMC2209 value (power of two,
-// 1..256). Keeps the pulse-rate math and the driver's divisor in agreement even if a bad
-// value slips through, which is what would otherwise make RPM drift when microsteps change.
+// Round an arbitrary microstep request to the nearest valid TMC2209 value (power of two, 1..256).
 static uint8_t sanitizeMicrosteps(uint8_t m) {
   const uint8_t valid[] = {1, 2, 4, 8, 16, 32, 64, 128, 255};  // 255 => 256 per TMCStepper
   uint8_t best = 16; uint16_t bestErr = 0xFFFF;
@@ -182,21 +176,10 @@ static uint8_t sanitizeMicrosteps(uint8_t m) {
   return best;
 }
 
-// Largest valid microstep setting (<= requested) whose step-pulse rate at |rpm| stays under the
-// C3's ceiling, so the commanded RPM is always achievable and independent of the microstep choice.
-static uint8_t fitMicrosteps(uint8_t requested, float rpm) {
-  float fullStepsPerRev = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
-  float stepsPerSec1x   = (fabsf(rpm) / 60.0f) * fullStepsPerRev;   // pulse rate at 1x microstep
-  uint8_t us = requested;
-  while (us > 1 && stepsPerSec1x * (float)us > (float)WHEEL_MAX_STEP_HZ) us >>= 1;
-  return us;
-}
-
 static void applyDriverParams() {
-  // Re-apply current/microsteps to both wheel drivers (called at boot and on every command
-  // that changes them). Mirrors the bring-up sequence used in rotating_rods_skr_pico, plus
-  // low-heat standstill settings: hold current = 0 + freewheel so a stopped-but-enabled motor
-  // dissipates almost nothing (the planets never need to hold position precisely).
+  // Re-apply current/microsteps to both wheel drivers (called at boot and whenever they change).
+  // Low-heat standstill: hold current 0 + freewheel so a stopped-but-enabled motor dissipates
+  // almost nothing (planets never need to hold position precisely).
   TMC2209Stepper *all[2] = {&drvL, &drvR};
   for (auto *d : all) {
     d->rms_current(g_currentMa, 0.0f);     // IRUN from mA; IHOLD = 0 (see freewheel below)
@@ -217,17 +200,15 @@ static void tmcBringup() {
     d->pdn_disable(true);       // required so UART (not the PDN pin) controls the driver
     d->I_scale_analog(false);   // internal Vref (ignore VREF pin)
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
+    d->VACTUAL(0);              // ensure the internal velocity generator starts stopped
   }
   applyDriverParams();
 }
 
-// Enable/disable the drivers. Three levers, strongest first:
-//   1. PIN_MOTOR_PWR cuts the motor supply (VM) to the drivers entirely when idle — true sleep,
-//      ~zero driver draw. VCC_IO stays powered from 3.3V, so the TMC register config survives
-//      the VM power-cycle and needs no re-init on wake.
-//   2. EN pin high disables the output stage.
-//   3. toff=0 gates the chopper off.
-// Planets are idle the vast majority of the time, so this is where the standby current goes.
+// Enable/disable the drivers. Levers, strongest first:
+//   1. PIN_MOTOR_PWR cuts the motor supply (VM) entirely when idle — true sleep, ~zero draw.
+//      VCC_IO stays on 3.3V so the TMC register config survives and needs no re-init on wake.
+//   2. EN pin high disables the output stage.  3. toff=0 gates the chopper off.
 static void motorsEnable(bool on) {
   if (on) {
     digitalWrite(PIN_MOTOR_PWR, HIGH);          // wake: motor supply on
@@ -235,6 +216,8 @@ static void motorsEnable(bool on) {
     drvL.toff(4); drvR.toff(4);                 // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
   } else {
+    drvL.VACTUAL(0); drvR.VACTUAL(0);           // stop the internal velocity generators
+    g_velCurL = g_velCurR = 0; g_velTgtL = g_velTgtR = 0;
     digitalWrite(PIN_TMC_EN, HIGH);             // disable outputs
     drvL.toff(0); drvR.toff(0);                 // chopper off
     digitalWrite(PIN_MOTOR_PWR, LOW);           // sleep: cut motor supply
@@ -247,38 +230,58 @@ static void lightSet(bool on) {
   g_lightOn = on;
 }
 
-// Continuous wheel rotation at a signed rpm. Direction handled via the TMC shaft bit
-// because the DIR pins are tied to GND; FastAccelStepper only produces step pulses.
-static void wheelRun(FastAccelStepper *st, TMC2209Stepper &drv, float rpm, bool invert) {
-  if (!st) return;
-  if (fabsf(rpm) < 0.01f) { st->stopMove(); return; }
-  drv.shaft((rpm < 0) ^ invert);        // back-to-back mount: right wheel spins the other way
-  uint32_t hz    = rpmToStepsHz(rpm);
-  if (hz > WHEEL_MAX_STEP_HZ) hz = WHEEL_MAX_STEP_HZ;   // safety clamp under the RMT ceiling
-  uint32_t accel = rpmToStepsHz(WHEEL_ACCEL_RPM_S);
-  st->setSpeedInHz(hz > 0 ? hz : 1);
-  st->setAcceleration(accel > 0 ? accel : 1);
-  st->runForward();
+static inline bool wheelsMoving() {
+  return (fabsf(g_velCurL) > 1.0f) || (fabsf(g_velCurR) > 1.0f);
 }
 
-static void wheelsStop() {
-  if (stepL) stepL->stopMove();
-  if (stepR) stepR->stopMove();
+// Set new wheel velocity targets (µsteps/s, signed) and pick a ramp rate that reaches them in
+// ~WHEEL_RAMP_S seconds. The right wheel is inverted for the back-to-back mount.
+static void wheelSetTargets(float lHz, float rHz) {
+  g_velTgtL = lHz;
+  g_velTgtR = rHz * (WHEEL_R_INVERT ? -1.0f : 1.0f);
+  float span = fmaxf(fmaxf(fabsf(g_velTgtL), fabsf(g_velTgtR)),
+                     fmaxf(fabsf(g_velCurL), fabsf(g_velCurR)));
+  g_rampRate = fmaxf(span / WHEEL_RAMP_S, 100.0f);
 }
 
-// Combined step position of both wheels (for detecting a frozen/stalled ramp).
-static int32_t wheelsPos() {
-  return (stepL ? stepL->getCurrentPosition() : 0) + (stepR ? stepR->getCurrentPosition() : 0);
+static inline void approach(float &cur, float tgt, float step) {
+  if (cur < tgt) { cur += step; if (cur > tgt) cur = tgt; }
+  else if (cur > tgt) { cur -= step; if (cur < tgt) cur = tgt; }
 }
 
-// Begin a gentle, decelerated stop and arm the deferred power-cut + stall watchdog. Call this
-// ONCE on the transition into stopping — re-issuing stopMove() every heartbeat freezes the
-// FastAccelStepper ramp (it gets stuck mid-decel, isRunning() stays true, motors never cut).
-static void beginStop() {
-  wheelsStop();
-  g_stopDisable = true;
-  g_stopProgMs  = millis();
-  g_stopLastPos = wheelsPos();
+// Software velocity ramp: nudge current velocity toward target and push VACTUAL to the drivers.
+// When the wheels reach a stop, run any deferred action (power-off, or microsteps-change resume).
+static void serviceRamp() {
+  uint32_t now = millis();
+  if (now - g_rampMs < VACTUAL_UPDATE_MS) return;
+  float dt = (now - g_rampMs) / 1000.0f;
+  g_rampMs = now;
+
+  float step = g_rampRate * dt;
+  approach(g_velCurL, g_velTgtL, step);
+  approach(g_velCurR, g_velTgtR, step);
+
+  if (g_motorsOn) {
+    drvL.VACTUAL((uint32_t)(int32_t)lroundf(g_velCurL * VACTUAL_PER_HZ));
+    drvR.VACTUAL((uint32_t)(int32_t)lroundf(g_velCurR * VACTUAL_PER_HZ));
+  }
+
+  bool stopped = (fabsf(g_velCurL) < 1.0f) && (fabsf(g_velCurR) < 1.0f);
+  if (!stopped) return;
+
+  if (g_resumePending) {                  // microsteps change: apply at standstill, then resume
+    g_resumePending = false;
+    g_currentMa  = g_pendingCurrent;
+    g_microsteps = g_pendingMicro;
+    applyDriverParams();
+    Serial.printf("microsteps applied=%u at standstill; re-accelerating to L=%.0f R=%.0f rpm\n",
+                  g_microsteps, g_pendingRpmL, g_pendingRpmR);
+    g_cmdWheelL = g_pendingRpmL; g_cmdWheelR = g_pendingRpmR;
+    wheelSetTargets(rpmToUstepsHz(g_pendingRpmL), rpmToUstepsHz(g_pendingRpmR));
+  } else if (g_stopThenOff && g_motorsOn) {   // ramped to a stop for CMD_STOP / homing: cut power
+    g_stopThenOff = false;
+    motorsEnable(false);
+  }
 }
 
 // ----------------------------- ESP-NOW --------------------------------------
@@ -292,80 +295,83 @@ static void addPeer(const uint8_t *mac) {
   esp_now_add_peer(&p);
 }
 
+// Command handoff. The ESP-NOW recv callback runs in the Wi-Fi task; it must NOT touch the TMC
+// UART or motor state (that all runs from loop()). It only copies the packet and raises a flag;
+// serviceCommand() below does the work from loop() so all driver access is serialized.
+static volatile bool g_cmdPending = false;
+static CmdMsg        g_rxCmd;
+
 static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len < 2 || data[0] != SOLAR_MAGIC || data[1] != SOLAR_MSG_CMD) return;
   if (len < (int)sizeof(CmdMsg)) return;
-  CmdMsg m;
-  memcpy(&m, data, sizeof(m));
 
   g_lastCmdMs = millis();
-  g_myIndex   = m.planet_index;
-
-  if (!g_sunKnown) {              // learn the Sun and switch to unicast replies
+  if (!g_sunKnown) {              // learn the Sun and switch to unicast replies (ESP-NOW only)
     memcpy(g_sunMac, mac, 6);
     g_sunKnown = true;
     addPeer(g_sunMac);
   }
+  memcpy(&g_rxCmd, data, sizeof(CmdMsg));
+  g_cmdPending = true;
+}
 
-  // Step angle first (the microstep cap below depends on it).
+// Apply the most recent command. Runs in loop() (main task). The Sun resends the active command
+// every ~2 s as a heartbeat, so this acts only on genuine changes.
+static void serviceCommand() {
+  if (!g_cmdPending) return;
+  g_cmdPending = false;
+  CmdMsg m = g_rxCmd;
+
+  g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
 
-  // Effective microsteps: snap to a valid TMC value, then cap it so the pulse rate for the
-  // fastest commanded wheel stays under the C3's step-rate ceiling. This keeps the commanded
-  // RPM independent of the microstep setting instead of stalling out at high microsteps.
-  uint8_t reqUs = sanitizeMicrosteps(m.microsteps);
-  float   maxRpm = fmaxf(fabsf(m.wheel_l_rpm), fabsf(m.wheel_r_rpm));
-  uint8_t effUs  = (maxRpm > 0.1f) ? fitMicrosteps(reqUs, maxRpm) : reqUs;
-  bool paramsChanged = false;
-  if (m.current_ma != g_currentMa || effUs != g_microsteps) {
-    if (effUs != reqUs)
-      Serial.printf("microsteps %u->%u (capped to hold %.0f rpm under %lu Hz)\n",
-                    reqUs, effUs, maxRpm, (unsigned long)WHEEL_MAX_STEP_HZ);
-    g_currentMa  = m.current_ma;
-    g_microsteps = effUs;
-    applyDriverParams();
-    paramsChanged = true;               // step rate depends on microsteps -> must re-issue speed
-  }
+  uint8_t effUs = sanitizeMicrosteps(m.microsteps);
+  bool microChanged  = (effUs != g_microsteps);
+  bool currentChanged = (m.current_ma != g_currentMa);
 
-  // The Sun resends the current command every ~2 s as a heartbeat. Re-issuing motion on every
-  // repeat is what froze the ramp before, so each case below acts only on a genuine change.
   switch (m.command) {
     case CMD_STOP:
-      g_homingStop = false;
+      g_homingStop = false; g_resumePending = false;
       g_cmdWheelL = 0; g_cmdWheelR = 0;
-      if (g_motorsOn && !g_stopDisable) beginStop();   // decelerate once, then cut power
+      if (g_motorsOn) { g_stopThenOff = true; wheelSetTargets(0, 0); }  // decelerate, then power off
       lightSet(false);
       break;
 
-    case CMD_RUN: {
-      g_homingStop = false; g_stopDisable = false;
-      bool changed = paramsChanged || !g_motorsOn ||
-                     m.wheel_l_rpm != g_cmdWheelL || m.wheel_r_rpm != g_cmdWheelR;
-      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-      if (!g_motorsOn) motorsEnable(true);
-      if (changed) {
-        wheelRun(stepL, drvL, m.wheel_l_rpm, false);
-        wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+    case CMD_RUN:
+      g_homingStop = false; g_stopThenOff = false;
+      // Changing microsteps while turning would jump the speed; decelerate to a stop, change it at
+      // standstill, then re-accelerate (serviceRamp completes the sequence). Safe & reliable with
+      // VACTUAL — no step-generator restart involved.
+      if (microChanged && wheelsMoving()) {
+        Serial.printf("microsteps %u->%u while running: STOP, apply, then re-accelerate\n",
+                      g_microsteps, effUs);
+        g_resumePending = true;
+        g_pendingMicro = effUs; g_pendingCurrent = m.current_ma;
+        g_pendingRpmL = m.wheel_l_rpm; g_pendingRpmR = m.wheel_r_rpm;
+        wheelSetTargets(0, 0);
+      } else if (!g_resumePending) {
+        if (currentChanged || microChanged) {
+          g_currentMa = m.current_ma; g_microsteps = effUs; applyDriverParams();
+        }
+        if (!g_motorsOn) motorsEnable(true);
+        g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
+        wheelSetTargets(rpmToUstepsHz(m.wheel_l_rpm), rpmToUstepsHz(m.wheel_r_rpm));
       }
       lightSet(m.light_on);
       break;
-    }
 
-    case CMD_HOME_AND_STOP: {           // drive slowly toward HOME; homing logic stops on the pulse
-      bool wasHoming = g_homingStop;
-      bool changed = paramsChanged || !wasHoming ||
-                     m.wheel_l_rpm != g_cmdWheelL || m.wheel_r_rpm != g_cmdWheelR;
-      g_homingStop = true; g_stopDisable = false;
-      if (!wasHoming) g_homeSeen = false;              // clear on entry only, not every heartbeat
-      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-      if (!g_motorsOn) motorsEnable(true);
-      if (changed) {
-        wheelRun(stepL, drvL, m.wheel_l_rpm, false);
-        wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+    case CMD_HOME_AND_STOP:           // drive slowly toward HOME; homing logic stops on the pulse
+      g_resumePending = false; g_stopThenOff = false;
+      if (currentChanged || microChanged) {
+        g_currentMa = m.current_ma; g_microsteps = effUs; applyDriverParams();
       }
+      if (!g_homingStop) g_homeSeen = false;    // clear on entry only, not every heartbeat
+      g_homingStop = true;
+      if (!g_motorsOn) motorsEnable(true);
+      g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
+      wheelSetTargets(rpmToUstepsHz(m.wheel_l_rpm), rpmToUstepsHz(m.wheel_r_rpm));
       lightSet(m.light_on);
       break;
-    }
 
     case CMD_LIGHT:
       lightSet(m.light_on);
@@ -381,7 +387,7 @@ static void sendStatus() {
   s.home_pulsed  = g_homePulse ? 1 : 0;
   s.error        = g_error;
   s.light_on     = g_lightOn ? 1 : 0;
-  s.moving       = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
+  s.moving       = wheelsMoving() ? 1 : 0;
   g_dieTempC     = readDieTempC();
   s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
   s.rssi         = g_sunRssi;
@@ -444,8 +450,7 @@ static void serviceFaults() {
     g_error = ERR_NONE; g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = stuckCnt = 0;
     return;
   }
-  bool moving = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
-  bool driving = g_motorsOn && moving;
+  bool driving = g_motorsOn && wheelsMoving();
 
   // Snapshot StallGuard load + open-load/overtemp flags for the heartbeat and tuning.
   g_sgL = drvL.SG_RESULT();
@@ -471,27 +476,13 @@ static void serviceFaults() {
   else if (!disc && !stuck)            g_error = ERR_NONE;
 }
 
-// ----------------------------- Homing / deferred stop ------------------------
+// ----------------------------- Homing ---------------------------------------
 static void serviceHoming() {
   if (g_homingStop && g_homeSeen) {
     g_homingStop = false;
-    beginStop();             // decelerate on the ramp, then cut power once stopped (below)
-  }
-  // Deferred power-down shared by CMD_STOP and homing: normally we wait for the deceleration
-  // ramp to finish (isRunning() false) so the stop is smooth. But FastAccelStepper can leave the
-  // ramp frozen mid-decel (isRunning() stuck true while no steps are emitted), which would keep
-  // the motors energized forever. So we also watch step progress: if the position stops advancing
-  // for >700 ms while still "running", the ramp is stuck -> forceStop and cut power anyway.
-  if (g_stopDisable) {
-    int32_t pos = wheelsPos();
-    if (pos != g_stopLastPos) { g_stopLastPos = pos; g_stopProgMs = millis(); }
-    bool running = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
-    bool stalled = running && (millis() - g_stopProgMs > 700);
-    if (!running || stalled) {
-      if (stalled) { if (stepL) stepL->forceStop(); if (stepR) stepR->forceStop(); }
-      g_stopDisable = false;
-      motorsEnable(false);
-    }
+    g_stopThenOff = true;      // decelerate to a stop on the ramp, then cut power (serviceRamp)
+    g_cmdWheelL = 0; g_cmdWheelR = 0;
+    wheelSetTargets(0, 0);
   }
 }
 
@@ -504,13 +495,15 @@ static void serviceButton() {
     g_selfTest = true;
     g_selfTestEndMs = millis() + 5000;
     motorsEnable(true);                 // jog both wheels slowly + light: a lone-cart self-test
-    wheelRun(stepL, drvL, 60, false);
-    wheelRun(stepR, drvR, 60, WHEEL_R_INVERT);
+    g_cmdWheelL = 60; g_cmdWheelR = 60;
+    wheelSetTargets(rpmToUstepsHz(60), rpmToUstepsHz(60));
     lightSet(true);
   }
   if (g_selfTest && millis() > g_selfTestEndMs) {
     g_selfTest = false;
-    beginStop();
+    g_stopThenOff = true;
+    g_cmdWheelL = 0; g_cmdWheelR = 0;
+    wheelSetTargets(0, 0);
     lightSet(false);
   }
 }
@@ -536,6 +529,8 @@ void setup() {
 
   pinMode(PIN_MOTOR_PWR, OUTPUT);  digitalWrite(PIN_MOTOR_PWR, LOW);  // motor supply asleep
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
+  pinMode(PIN_STEP_L, OUTPUT);     digitalWrite(PIN_STEP_L, LOW);    // unused with VACTUAL
+  pinMode(PIN_STEP_R, OUTPUT);     digitalWrite(PIN_STEP_R, LOW);
   pinMode(PIN_LIGHT_EN, OUTPUT);   digitalWrite(PIN_LIGHT_EN, LOW);
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);
   pinMode(PIN_HOME, INPUT_PULLUP);
@@ -550,12 +545,6 @@ void setup() {
 
   tmcBringup();
 
-  engine.init();
-  stepL = engine.stepperConnectToPin(PIN_STEP_L);
-  stepR = engine.stepperConnectToPin(PIN_STEP_R);
-  if (stepL) stepL->setAutoEnable(false);
-  if (stepR) stepR->setAutoEnable(false);
-
   if (!discoverChannel()) {
     Serial.println("Sun AP not found yet; will retry while OFFLINE.");
   }
@@ -563,6 +552,7 @@ void setup() {
     Serial.println("ESP-NOW init failed!");
   }
   g_nextStatusMs = millis() + 1000;
+  g_rampMs = millis();
 }
 
 void loop() {
@@ -571,7 +561,9 @@ void loop() {
   updateState();
   serviceStatusLed();
   serviceButton();
+  serviceCommand();
   serviceHoming();
+  serviceRamp();
   serviceFaults();
 
   // Periodic status transmit, jittered 1-3s to avoid collisions among the 8 carts.
@@ -593,39 +585,20 @@ void loop() {
     g_dieTempC = readDieTempC();
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
     bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
-    // Target step rate the firmware is asking FastAccelStepper to emit for each wheel, so a
-    // scope reading on STEP can be compared directly against the commanded rpm (Hz should equal
-    // rpm/60 * 360/step_degree * microsteps). "runL/R" = FastAccelStepper actually stepping.
-    uint32_t hzL = rpmToStepsHz(g_cmdWheelL), hzR = rpmToStepsHz(g_cmdWheelR);
-    bool runL = stepL && stepL->isRunning(), runR = stepR && stepR->isRunning();
-    // Instrument-independent ground truth: the library's actual current ramp speed, and the real
-    // steps emitted since the last heartbeat (position delta / elapsed). If these match the target
-    // Hz then the STEP pin truly toggles that fast and any lower external reading is a measurement
-    // artifact (FastAccelStepper emits steps in RMT bursts that fool simple frequency counters).
-    static int32_t lastPosL = 0, lastPosR = 0; static uint32_t lastRateMs = 0;
-    int32_t posL = stepL ? stepL->getCurrentPosition() : 0;
-    int32_t posR = stepR ? stepR->getCurrentPosition() : 0;
-    uint32_t dt = now - lastRateMs; if (dt == 0) dt = 1;
-    uint32_t measHzL = (uint32_t)(labs(posL - lastPosL) * 1000L / (long)dt);
-    uint32_t measHzR = (uint32_t)(labs(posR - lastPosR) * 1000L / (long)dt);
-    lastPosL = posL; lastPosR = posR; lastRateMs = now;
-    uint32_t curHzL = stepL ? (uint32_t)(labs(stepL->getCurrentSpeedInMilliHz()) / 1000) : 0;
-    uint32_t curHzR = stepR ? (uint32_t)(labs(stepR->getCurrentSpeedInMilliHz()) / 1000) : 0;
-    const char *rsL = stepL ? rampText(stepL->rampState()) : "idle";
-    const char *rsR = stepR ? rampText(stepR->rampState()) : "idle";
-    Serial.printf("        actual: curHz L=%lu(%s) R=%lu(%s) | measured(pos delta) L=%lu R=%lu Hz\n",
-                  (unsigned long)curHzL, rsL, (unsigned long)curHzR, rsR,
-                  (unsigned long)measHzL, (unsigned long)measHzR);
+    // Current wheel velocities in µsteps/s and the equivalent rpm, so a bench check can confirm
+    // the motor is actually turning at the commanded speed (VACTUAL, no external step pin).
+    float fullSteps = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
+    float rpmL = g_velCurL / (fullSteps * g_microsteps) * 60.0f;
+    float rpmR = g_velCurR / (fullSteps * g_microsteps) * 60.0f;
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
                   "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | "
-                  "cmd L=%.0f R=%.0f rpm -> stepHz L=%lu(%s) R=%lu(%s) | "
+                  "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f ustep/s) | "
                   "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
                   errText(g_error), g_currentMa, g_microsteps, g_stepDegree,
                   g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
-                  (unsigned long)hzL, runL ? "run" : "idle",
-                  (unsigned long)hzR, runR ? "run" : "idle",
+                  rpmL, rpmR, g_velCurL, g_velCurR,
                   g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }
