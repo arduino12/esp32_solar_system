@@ -62,8 +62,8 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
   "planets": {
     "mac_address": ["","","","","","","",""],
     "wheels": {
-      "diameter_mm": 20,
-      "stepper": { "current_amp": 1.5, "microsteps": 16, "step_degree": 1.8,
+      "diameter_mm": 36,
+      "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
     },
     "rail": {
@@ -283,7 +283,7 @@ static void sendCmd(int i, const CmdMsg &m) {
 // orbital speed for the web animation. See plan "Per-planet speed computation".
 static CmdMsg buildRunCmd(int i, bool light) {
   JsonObject pl   = g_settings["planets"];
-  float dWheel    = pl["wheels"]["diameter_mm"] | 20.0f;
+  float dWheel    = pl["wheels"]["diameter_mm"] | 36.0f;
   float railW     = pl["rail"]["width_mm"]      | 70.0f;
   float innerD    = pl["rail"]["inner_diameter_mm"][i] | 500.0f;
   float base      = pl["rail"]["log_scale_speed_rpm"][i] | 100.0f;
@@ -305,7 +305,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_l_rpm = wheelL * sign;
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
-  m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 1.5f) * 1000.0f);
+  m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.microsteps  = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   return m;
@@ -317,11 +317,11 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_CMD; m.planet_index = i;
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
-  m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 1.5f) * 1000.0f);
+  m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.microsteps = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
-    float dWheel = pl["wheels"]["diameter_mm"] | 20.0f;
+    float dWheel = pl["wheels"]["diameter_mm"] | 36.0f;
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
     float innerD = pl["rail"]["inner_diameter_mm"][i] | 500.0f;
     float Rin = innerD * 0.5f, Rout = Rin + railW;

@@ -69,7 +69,7 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define OFFLINE_RESCAN_MS  10000
 
 // Boot defaults (overwritten by the first command from the Sun).
-static uint16_t g_currentMa   = 1000;      // current_amp=1.0
+static uint16_t g_currentMa   = 200;       // current_amp=0.2 (RMS)
 static uint8_t  g_microsteps  = 16;
 static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev = 360/step_degree
 
@@ -544,13 +544,21 @@ void loop() {
     g_dieTempC = readDieTempC();
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
     bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
+    // Target step rate the firmware is asking FastAccelStepper to emit for each wheel, so a
+    // scope reading on STEP can be compared directly against the commanded rpm (Hz should equal
+    // rpm/60 * 360/step_degree * microsteps). "runL/R" = FastAccelStepper actually stepping.
+    uint32_t hzL = rpmToStepsHz(g_cmdWheelL), hzR = rpmToStepsHz(g_cmdWheelR);
+    bool runL = stepL && stepL->isRunning(), runR = stepR && stepR->isRunning();
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
-                  "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | cmd L=%.0f R=%.0f rpm | "
+                  "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | "
+                  "cmd L=%.0f R=%.0f rpm -> stepHz L=%lu(%s) R=%lu(%s) | "
                   "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
                   errText(g_error), g_currentMa, g_microsteps, g_stepDegree,
                   g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
+                  (unsigned long)hzL, runL ? "run" : "idle",
+                  (unsigned long)hzR, runR ? "run" : "idle",
                   g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }
