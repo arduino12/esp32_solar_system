@@ -95,6 +95,8 @@ static uint8_t  g_error       = ERR_NONE;
 static float    g_cmdWheelL   = 0;
 static float    g_cmdWheelR   = 0;
 static bool     g_stopDisable = false;     // decelerate first, cut driver power once stopped
+static uint32_t g_stopProgMs  = 0;         // last time step position advanced while stopping
+static int32_t  g_stopLastPos = 0;         // step position snapshot for stall detection
 
 // Diagnostics reported back to the Sun and printed in the heartbeat.
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
@@ -133,6 +135,17 @@ static inline uint8_t rssiPct(int8_t rssi) {
   if (rssi == 0) return 0;                       // unknown
   int p = 2 * (rssi + 100);
   return (uint8_t)constrain(p, 0, 100);
+}
+
+// Decode a FastAccelStepper rampState() bitfield to a short word for the heartbeat.
+static const char *rampText(uint8_t rs) {
+  switch (rs & RAMP_STATE_MASK) {
+    case RAMP_STATE_COAST:      return "COAST";   // at target speed (constant)
+    case RAMP_STATE_ACCELERATE: return "ACCEL";   // ramping up
+    case RAMP_STATE_DECELERATE: return "DECEL";   // ramping down
+    case RAMP_STATE_REVERSE:    return "REVERSE";
+    default:                    return "idle";
+  }
 }
 
 static const char *errText(uint8_t e) {
@@ -253,6 +266,21 @@ static void wheelsStop() {
   if (stepR) stepR->stopMove();
 }
 
+// Combined step position of both wheels (for detecting a frozen/stalled ramp).
+static int32_t wheelsPos() {
+  return (stepL ? stepL->getCurrentPosition() : 0) + (stepR ? stepR->getCurrentPosition() : 0);
+}
+
+// Begin a gentle, decelerated stop and arm the deferred power-cut + stall watchdog. Call this
+// ONCE on the transition into stopping — re-issuing stopMove() every heartbeat freezes the
+// FastAccelStepper ramp (it gets stuck mid-decel, isRunning() stays true, motors never cut).
+static void beginStop() {
+  wheelsStop();
+  g_stopDisable = true;
+  g_stopProgMs  = millis();
+  g_stopLastPos = wheelsPos();
+}
+
 // ----------------------------- ESP-NOW --------------------------------------
 static void addPeer(const uint8_t *mac) {
   if (esp_now_is_peer_exist(mac)) return;
@@ -288,6 +316,7 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   uint8_t reqUs = sanitizeMicrosteps(m.microsteps);
   float   maxRpm = fmaxf(fabsf(m.wheel_l_rpm), fabsf(m.wheel_r_rpm));
   uint8_t effUs  = (maxRpm > 0.1f) ? fitMicrosteps(reqUs, maxRpm) : reqUs;
+  bool paramsChanged = false;
   if (m.current_ma != g_currentMa || effUs != g_microsteps) {
     if (effUs != reqUs)
       Serial.printf("microsteps %u->%u (capped to hold %.0f rpm under %lu Hz)\n",
@@ -295,36 +324,48 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
     g_currentMa  = m.current_ma;
     g_microsteps = effUs;
     applyDriverParams();
+    paramsChanged = true;               // step rate depends on microsteps -> must re-issue speed
   }
 
+  // The Sun resends the current command every ~2 s as a heartbeat. Re-issuing motion on every
+  // repeat is what froze the ramp before, so each case below acts only on a genuine change.
   switch (m.command) {
     case CMD_STOP:
       g_homingStop = false;
       g_cmdWheelL = 0; g_cmdWheelR = 0;
-      wheelsStop();                 // decelerate on the ramp; power is cut once stopped
-      g_stopDisable = true;
+      if (g_motorsOn && !g_stopDisable) beginStop();   // decelerate once, then cut power
       lightSet(false);
       break;
 
-    case CMD_RUN:
+    case CMD_RUN: {
       g_homingStop = false; g_stopDisable = false;
+      bool changed = paramsChanged || !g_motorsOn ||
+                     m.wheel_l_rpm != g_cmdWheelL || m.wheel_r_rpm != g_cmdWheelR;
       g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-      motorsEnable(true);
-      wheelRun(stepL, drvL, m.wheel_l_rpm, false);
-      wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+      if (!g_motorsOn) motorsEnable(true);
+      if (changed) {
+        wheelRun(stepL, drvL, m.wheel_l_rpm, false);
+        wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+      }
       lightSet(m.light_on);
       break;
+    }
 
-    case CMD_HOME_AND_STOP:
-      // Drive both wheels slowly toward HOME; homing logic stops on the pulse.
+    case CMD_HOME_AND_STOP: {           // drive slowly toward HOME; homing logic stops on the pulse
+      bool wasHoming = g_homingStop;
+      bool changed = paramsChanged || !wasHoming ||
+                     m.wheel_l_rpm != g_cmdWheelL || m.wheel_r_rpm != g_cmdWheelR;
       g_homingStop = true; g_stopDisable = false;
-      g_homeSeen   = false;
+      if (!wasHoming) g_homeSeen = false;              // clear on entry only, not every heartbeat
       g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-      motorsEnable(true);
-      wheelRun(stepL, drvL, m.wheel_l_rpm, false);
-      wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+      if (!g_motorsOn) motorsEnable(true);
+      if (changed) {
+        wheelRun(stepL, drvL, m.wheel_l_rpm, false);
+        wheelRun(stepR, drvR, m.wheel_r_rpm, WHEEL_R_INVERT);
+      }
       lightSet(m.light_on);
       break;
+    }
 
     case CMD_LIGHT:
       lightSet(m.light_on);
@@ -434,14 +475,23 @@ static void serviceFaults() {
 static void serviceHoming() {
   if (g_homingStop && g_homeSeen) {
     g_homingStop = false;
-    wheelsStop();            // decelerate on the ramp
-    g_stopDisable = true;    // ...then cut power once actually stopped (below)
+    beginStop();             // decelerate on the ramp, then cut power once stopped (below)
   }
-  // Deferred power-down shared by CMD_STOP and homing: wait for the deceleration ramp to
-  // finish before disabling the driver, so stops are smooth instead of an instant chop.
-  if (g_stopDisable && !((stepL && stepL->isRunning()) || (stepR && stepR->isRunning()))) {
-    g_stopDisable = false;
-    motorsEnable(false);
+  // Deferred power-down shared by CMD_STOP and homing: normally we wait for the deceleration
+  // ramp to finish (isRunning() false) so the stop is smooth. But FastAccelStepper can leave the
+  // ramp frozen mid-decel (isRunning() stuck true while no steps are emitted), which would keep
+  // the motors energized forever. So we also watch step progress: if the position stops advancing
+  // for >700 ms while still "running", the ramp is stuck -> forceStop and cut power anyway.
+  if (g_stopDisable) {
+    int32_t pos = wheelsPos();
+    if (pos != g_stopLastPos) { g_stopLastPos = pos; g_stopProgMs = millis(); }
+    bool running = (stepL && stepL->isRunning()) || (stepR && stepR->isRunning());
+    bool stalled = running && (millis() - g_stopProgMs > 700);
+    if (!running || stalled) {
+      if (stalled) { if (stepL) stepL->forceStop(); if (stepR) stepR->forceStop(); }
+      g_stopDisable = false;
+      motorsEnable(false);
+    }
   }
 }
 
@@ -460,8 +510,7 @@ static void serviceButton() {
   }
   if (g_selfTest && millis() > g_selfTestEndMs) {
     g_selfTest = false;
-    wheelsStop();
-    g_stopDisable = true;
+    beginStop();
     lightSet(false);
   }
 }
@@ -549,6 +598,24 @@ void loop() {
     // rpm/60 * 360/step_degree * microsteps). "runL/R" = FastAccelStepper actually stepping.
     uint32_t hzL = rpmToStepsHz(g_cmdWheelL), hzR = rpmToStepsHz(g_cmdWheelR);
     bool runL = stepL && stepL->isRunning(), runR = stepR && stepR->isRunning();
+    // Instrument-independent ground truth: the library's actual current ramp speed, and the real
+    // steps emitted since the last heartbeat (position delta / elapsed). If these match the target
+    // Hz then the STEP pin truly toggles that fast and any lower external reading is a measurement
+    // artifact (FastAccelStepper emits steps in RMT bursts that fool simple frequency counters).
+    static int32_t lastPosL = 0, lastPosR = 0; static uint32_t lastRateMs = 0;
+    int32_t posL = stepL ? stepL->getCurrentPosition() : 0;
+    int32_t posR = stepR ? stepR->getCurrentPosition() : 0;
+    uint32_t dt = now - lastRateMs; if (dt == 0) dt = 1;
+    uint32_t measHzL = (uint32_t)(labs(posL - lastPosL) * 1000L / (long)dt);
+    uint32_t measHzR = (uint32_t)(labs(posR - lastPosR) * 1000L / (long)dt);
+    lastPosL = posL; lastPosR = posR; lastRateMs = now;
+    uint32_t curHzL = stepL ? (uint32_t)(labs(stepL->getCurrentSpeedInMilliHz()) / 1000) : 0;
+    uint32_t curHzR = stepR ? (uint32_t)(labs(stepR->getCurrentSpeedInMilliHz()) / 1000) : 0;
+    const char *rsL = stepL ? rampText(stepL->rampState()) : "idle";
+    const char *rsR = stepR ? rampText(stepR->rampState()) : "idle";
+    Serial.printf("        actual: curHz L=%lu(%s) R=%lu(%s) | measured(pos delta) L=%lu R=%lu Hz\n",
+                  (unsigned long)curHzL, rsL, (unsigned long)curHzR, rsR,
+                  (unsigned long)measHzL, (unsigned long)measHzR);
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
                   "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | "
                   "cmd L=%.0f R=%.0f rpm -> stepHz L=%lu(%s) R=%lu(%s) | "
