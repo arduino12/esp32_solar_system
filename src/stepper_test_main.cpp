@@ -37,9 +37,13 @@ static const uint8_t PIN_STEP_R     = 1;   // right wheel STEP  (LEDC ch 1)
 static const uint8_t PIN_MOTOR_PWR  = 5;   // high-side switch for VM (HIGH = supply on)
 static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
 
+// LEDC channels are paired to timers as timer=(chan/2), and one timer has ONE frequency. So the
+// two motors MUST sit on channels of different timers to run at independent speeds: ch0 -> timer0,
+// ch2 -> timer1. Both timers still derive from the single 80 MHz clock, so the frequency ratio
+// stays exact (synchronized). (Using ch0+ch1 forces both motors to the same frequency.)
 #define LEDC_CH_L     0
-#define LEDC_CH_R     1
-#define LEDC_RES_BITS 8            // 8-bit duty; ledcWriteTone manages the timer for us
+#define LEDC_CH_R     2
+#define LEDC_CLK_HZ   80000000.0   // APB clock feeding LEDC
 
 #define TMC_R_SENSE   0.11f
 #define TMC_UART_BAUD 115200
@@ -67,8 +71,9 @@ struct MotorCfg {
 };
 static MotorCfg g_cfg[2];         // [0]=L, [1]=R
 static bool  g_enabled = false;   // drivers powered/enabled
-static float g_curHz[2] = {0, 0}; // current LEDC output frequency (= step rate) per motor
-static float g_tgtHz[2] = {0, 0}; // target frequency per motor
+static float g_curHz[2] = {0, 0}; // ramp's current commanded step rate per motor
+static float g_tgtHz[2] = {0, 0}; // target step rate per motor
+static float g_actHz[2] = {0, 0}; // actual frequency LEDC achieved (read back from the hardware)
 static uint32_t g_rampMs = 0;
 
 // Per-apply UART verification results.
@@ -148,7 +153,21 @@ static void tmcBringup() {
   }
 }
 
-static void ledcStop(int i) { ledcWrite(ledcCh(i), 0); }   // duty 0 -> STEP held low (no pulses)
+static void ledcStop(int i) { ledcWrite(ledcCh(i), 0); g_actHz[i] = 0; }  // duty 0 -> STEP low
+
+// Emit a hardware square wave at f Hz on the motor's STEP pin, choosing the LEDC resolution so the
+// clock divider is well-conditioned (small resolution -> large divider -> fine fractional-divider
+// granularity -> accurate frequency, unlike ledcWriteTone's fixed 10-bit that mis-divides fast
+// tones). Records the ACTUAL achieved frequency (ledcSetup returns it) for honest status display.
+static void stepEmit(int i, float f) {
+  int ch = ledcCh(i);
+  if (f < 1.0f) { ledcStop(i); return; }
+  int res = 1;
+  while (res < 14 && (LEDC_CLK_HZ / (f * (double)(1u << res))) > 1023.0) res++;  // keep int div <=1023
+  uint32_t act = ledcSetup(ch, (uint32_t)(f + 0.5f), res);   // reconfigures the timer; returns Hz
+  ledcWrite(ch, (1u << res) / 2);                            // 50% duty at this resolution
+  g_actHz[i] = act ? (float)act : f;
+}
 
 static void enableDrivers(bool on) {
   if (on) {
@@ -159,6 +178,7 @@ static void enableDrivers(bool on) {
   } else {
     ledcStop(0); ledcStop(1);
     g_curHz[0] = g_curHz[1] = g_tgtHz[0] = g_tgtHz[1] = 0;
+    g_actHz[0] = g_actHz[1] = 0;
     digitalWrite(PIN_TMC_EN, HIGH);
     drvL.toff(0); drvR.toff(0);
     digitalWrite(PIN_MOTOR_PWR, LOW);
@@ -192,10 +212,8 @@ static void serviceRamp() {
     else if (cur > tgt) { cur -= stepv; if (cur < tgt) cur = tgt; }
     g_curHz[i] = cur;
 
-    if (g_enabled) {
-      if (cur < 1.0f) ledcStop(i);
-      else            ledcWriteTone(ledcCh(i), (uint32_t)cur);   // hardware square wave at cur Hz
-    }
+    if (g_enabled) stepEmit(i, cur);
+    else           g_actHz[i] = 0;
   }
 }
 
@@ -213,10 +231,10 @@ static void buildStatus(String &out) {
 
     JsonObject m = ms.add<JsonObject>();
     m["id"]      = ids[i];
-    m["running"] = g_curHz[i] > 1.0f;
+    m["running"] = g_actHz[i] > 1.0f;
     m["cmd_rpm"] = c.run ? (c.dirCW ? c.speedRpm : -c.speedRpm) : 0.0f;
-    m["cur_rpm"] = hzToRpm(c, g_curHz[i]) * (c.dirCW ? 1 : -1);   // from the live LEDC frequency
-    m["cur_hz"]  = g_curHz[i];
+    m["cur_rpm"] = hzToRpm(c, g_actHz[i]) * (c.dirCW ? 1 : -1);   // from the ACTUAL LEDC frequency
+    m["cur_hz"]  = g_actHz[i];
 
     JsonObject cf = m["cfg"].to<JsonObject>();
     cf["microsteps"] = c.microsteps;
@@ -435,9 +453,10 @@ void setup() {
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);
 
-  // LEDC: attach each STEP pin to a channel. ledcWriteTone will set the frequency (= step rate).
-  ledcSetup(LEDC_CH_L, 1000, LEDC_RES_BITS); ledcAttachPin(PIN_STEP_L, LEDC_CH_L); ledcWrite(LEDC_CH_L, 0);
-  ledcSetup(LEDC_CH_R, 1000, LEDC_RES_BITS); ledcAttachPin(PIN_STEP_R, LEDC_CH_R); ledcWrite(LEDC_CH_R, 0);
+  // LEDC: attach each STEP pin to a channel on its own timer (ch0/timer0, ch2/timer1). stepEmit()
+  // sets the frequency (= step rate) with a per-frequency resolution for accuracy.
+  ledcSetup(LEDC_CH_L, 1000, 8); ledcAttachPin(PIN_STEP_L, LEDC_CH_L); ledcWrite(LEDC_CH_L, 0);
+  ledcSetup(LEDC_CH_R, 1000, 8); ledcAttachPin(PIN_STEP_R, LEDC_CH_R); ledcWrite(LEDC_CH_R, 0);
 
   tmcBringup();
 
@@ -482,7 +501,7 @@ void loop() {
       uint16_t usRb = dd.microsteps(); if (usRb == 0) usRb = 1;
       Serial.printf("M%c[%s hz=%.0f us=%u dir=%s I=%umA sg=%u ifc=%u wr:%s] ",
                     i ? 'R' : 'L', dd.test_connection() == 0 ? "conn" : "DISC",
-                    g_curHz[i], usRb, dd.shaft() ? "CCW" : "CW", dd.cs2rms(dd.cs_actual()),
+                    g_actHz[i], usRb, dd.shaft() ? "CCW" : "CW", dd.cs2rms(dd.cs_actual()),
                     dd.SG_RESULT(), dd.IFCNT(),
                     g_wc[i].checked && g_wc[i].ustepsRead == g_wc[i].ustepsWanted ? "ok" : "?");
     }
