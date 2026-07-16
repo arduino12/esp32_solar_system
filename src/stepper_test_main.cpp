@@ -60,7 +60,8 @@ AsyncWebServer server(80);
 // ----------------------------- Motor state ----------------------------------
 struct MotorCfg {
   uint16_t microsteps = 16;       // 1..256 (1 = full step)
-  uint16_t currentMa  = 200;
+  uint16_t currentMa  = 200;      // IRUN (running) RMS current
+  uint8_t  holdPct    = 50;       // IHOLD as % of run current at standstill (0 = release/freewheel)
   float    stepDegree = 1.8f;
   float    accelRpmS  = 300.0f;   // acceleration in rpm per second
   float    decelRpmS  = 300.0f;   // deceleration in rpm per second
@@ -125,12 +126,13 @@ static void applyDriver(int i) {
   WriteCheck &w = g_wc[i];
 
   uint8_t before = d.IFCNT();
-  d.rms_current(c.currentMa, 0.0f);
+  d.rms_current(c.currentMa, c.holdPct / 100.0f);   // IRUN, and IHOLD = holdPct% of it
   w.ustepsRead   = setMicrostepsVerified(d, c.microsteps, w.usTries);
   d.intpol(c.interpolate);              // MicroPlyer: smooth 256-microstep output from low usteps
   d.en_spreadCycle(c.spread);
-  d.TPOWERDOWN(20);
-  d.freewheel(1);
+  d.iholddelay(4);                      // gentle IRUN->IHOLD ramp when the motor stops
+  d.TPOWERDOWN(20);                     // ~0.3 s at standstill before dropping to IHOLD
+  d.freewheel(c.holdPct > 0 ? 0 : 1);   // holdPct>0: keep hold torque; 0: release coils (freewheel)
   uint8_t after = d.IFCNT();
 
   w.ifcntDelta   = (uint8_t)(after - before);
@@ -240,6 +242,7 @@ static void buildStatus(String &out) {
     JsonObject cf = m["cfg"].to<JsonObject>();
     cf["microsteps"] = c.microsteps;
     cf["current_ma"] = c.currentMa;
+    cf["hold_pct"]   = c.holdPct;
     cf["step_degree"]= c.stepDegree;
     cf["accel"]      = c.accelRpmS;
     cf["decel"]      = c.decelRpmS;
@@ -317,6 +320,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
  <div class=row><label>Microsteps</label>
    <select id=microsteps><option>1<option>2<option>4<option>8<option selected>16<option>32<option>64<option>128<option>256</select>
    <label>Current (mA)</label><input id=current_ma type=number value=200>
+   <label>Hold (%)</label><input id=hold_pct type=number value=50 title="IHOLD as % of run current at standstill; 0 = release/freewheel">
    <label>Step angle°</label><input id=step_degree type=number step=0.1 value=1.8>
  </div>
  <div class=row><label>Accel (rpm/s)</label><input id=accel type=number value=300>
@@ -352,8 +356,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <script>
 const $=id=>document.getElementById(id);
 function cfg(){return{microsteps:+$('microsteps').value,current_ma:+$('current_ma').value,
-  step_degree:+$('step_degree').value,accel:+$('accel').value,decel:+$('decel').value,
-  mode:$('mode').value,microplyer:$('microplyer').value=='1'};}
+  hold_pct:+$('hold_pct').value,step_degree:+$('step_degree').value,accel:+$('accel').value,
+  decel:+$('decel').value,mode:$('mode').value,microplyer:$('microplyer').value=='1'};}
 function motor(m){return{speed:+$(m+'speed').value,dir:$(m+'dir').value};}
 function post(p,o){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}
 function en(on){post('/api/enable',{on:!!on});}
@@ -372,7 +376,7 @@ function fill(el,m,t){
   h+=row('version','0x'+t.version.toString(16)+(t.version==0x21?' <span class=ok>(TMC2209)</span>':' <span class=bad>?</span>'));
   h+=row('microsteps (set/read)',chk(m.cfg.microsteps,t.usteps_rb));
   h+=row('direction (set/read)',chk(m.cfg.dir,t.dir_rb));
-  h+=row('current set / read',m.cfg.current_ma+' mA / <b>'+t.irms_rb+' mA</b> <span style="color:#888">(cs '+t.cs_actual+')</span>');
+  h+=row('current set / read',m.cfg.current_ma+' mA (hold '+m.cfg.hold_pct+'%) / <b>'+t.irms_rb+' mA</b> <span style="color:#888">(cs '+t.cs_actual+')</span>');
   h+=row('StallGuard',t.sg+(m.running&&t.sg==0?' <span class=bad>(stuck?)</span>':''));
   h+=row('standstill',b(t.stst));
   h+=row('mode',t.stealth?'stealthChop':'spreadCycle');
@@ -404,6 +408,7 @@ static void ingest(JsonVariant &j) {
     for (int i = 0; i < 2; i++) {
       g_cfg[i].microsteps = c["microsteps"] | g_cfg[i].microsteps;   // uint16 -> 256 fits
       g_cfg[i].currentMa  = c["current_ma"] | g_cfg[i].currentMa;
+      g_cfg[i].holdPct    = c["hold_pct"]   | g_cfg[i].holdPct;
       g_cfg[i].stepDegree = c["step_degree"]| g_cfg[i].stepDegree;
       g_cfg[i].accelRpmS  = c["accel"]      | g_cfg[i].accelRpmS;
       g_cfg[i].decelRpmS  = c["decel"]      | g_cfg[i].decelRpmS;
