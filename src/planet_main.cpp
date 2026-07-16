@@ -136,7 +136,7 @@ static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last ch
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
 static uint16_t g_sgL = 0, g_sgR = 0;      // last StallGuard load readings (for tuning)
 static float    g_sgAvgL = 0, g_sgAvgR = 0;// running (EMA) StallGuard load per wheel
-static uint32_t g_stallRecoverMs = 0;      // when !=0: millis() at which to spin up again after a stall
+static uint32_t g_faultRecoverMs = 0;      // when !=0: millis() at which to spin up again after a motor fault
 static uint8_t  g_drvStat = 0;             // last open-load/overtemp flag snapshot (bitfield)
 
 static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
@@ -414,7 +414,7 @@ static void serviceCommand() {
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
   g_stallThreshold = m.stall_threshold;     // stuck-detection threshold (0 = disabled)
-  g_stallRecoverMs = 0;                      // a fresh command supersedes any pending auto-retry
+  g_faultRecoverMs = 0;                      // a fresh command supersedes any pending auto-retry
 
   // Unpack the driver-config byte (microsteps enum + chopper + MicroPlyer bits).
   uint16_t effUs = solarMicrostepsFromEnum(m.driver_cfg & 0x0F);
@@ -543,22 +543,24 @@ static void serviceStatusLed() {
   digitalWrite(PIN_STATUS_LED, on ? LOW : HIGH);        // active-low
 }
 
-// A wheel is mechanically held. Stop the cart INSTANTLY (no decel ramp): kill both step trains and
-// disable the drivers, report the fault right away, then schedule a fresh spin-up (as if a new RUN
-// arrived) as long as the Sun still wants us moving. The status is pushed immediately so the Sun
-// registers the stall even though the fault clears again the moment the drivers go idle.
-static void handleStall() {
-  Serial.printf("STALL detected (sgAvg L=%.0f R=%.0f thr=%u): hard stop + retry\n",
-                g_sgAvgL, g_sgAvgR, g_stallThreshold);
-  g_error = ERR_MOTOR_STUCK;
+// A motor fault (StallGuard stall OR a disconnect/open-load) means we can't trust the motion. Stop
+// the cart INSTANTLY (no decel ramp): kill both step trains and disable the drivers, report the
+// fault right away, then schedule a fresh spin-up (as if a new RUN arrived) as long as the Sun
+// still wants us moving. The status is pushed immediately so the Sun registers the fault even
+// though it clears again the moment the drivers go idle. Both stuck and disconnected motors get
+// this same stop-and-retry treatment.
+static void handleMotorFault(uint8_t err) {
+  Serial.printf("%s (sgAvg L=%.0f R=%.0f thr=%u): hard stop + retry\n",
+                errText(err), g_sgAvgL, g_sgAvgR, g_stallThreshold);
+  g_error = err;
   ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);    // instant: STEP lines low, no deceleration
   g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
   g_velFinalL = g_velFinalR = 0; g_actHzL = g_actHzR = 0; g_rampFrac = 1.0f;
   g_resumePending = false; g_stopThenOff = false;
-  sendStatus();                                        // make sure the Sun sees ERR_MOTOR_STUCK
+  sendStatus();                                        // make sure the Sun sees the fault
   motorsEnable(false);                                 // disable outputs + cut VM
   bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
-  g_stallRecoverMs = wantMotion ? (millis() + STALL_RESTART_MS) : 0;
+  g_faultRecoverMs = wantMotion ? (millis() + STALL_RESTART_MS) : 0;
 }
 
 // ----------------------------- Fault polling --------------------------------
@@ -573,7 +575,8 @@ static void serviceFaults() {
 
   static uint8_t discCnt = 0;
   if (!g_motorsOn) {                     // drivers asleep (VM may be cut): nothing valid to read
-    if (g_error != ERR_MOTOR_STUCK) g_error = ERR_NONE;  // keep a just-set stall until recovery
+    if (g_error != ERR_MOTOR_STUCK && g_error != ERR_MOTOR_DISCONNECTED)
+      g_error = ERR_NONE;                // keep a just-set fault latched until recovery re-accelerates
     g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = 0;
     return;
   }
@@ -604,20 +607,20 @@ static void serviceFaults() {
                 (rMoving && g_sgAvgR < (float)g_stallThreshold));
 
   discCnt = disc ? (uint8_t)(discCnt + 1) : 0;
-  if (discCnt >= FAULT_DEBOUNCE) { g_error = ERR_MOTOR_DISCONNECTED; return; }
-  if (stuck)                     { handleStall(); return; }
+  if (discCnt >= FAULT_DEBOUNCE) { handleMotorFault(ERR_MOTOR_DISCONNECTED); return; }
+  if (stuck)                     { handleMotorFault(ERR_MOTOR_STUCK); return; }
   g_error = ERR_NONE;                                  // healthy (or still accelerating)
 }
 
-// Finish a stall recovery: after the brief post-stop pause, re-enable and ramp back up to the last
-// commanded speed — but only while the Sun still wants motion and the cart is still online. (A
-// fresh command that arrives during the pause clears g_stallRecoverMs and restarts us itself.)
-static void serviceStallRecover() {
-  if (!g_stallRecoverMs || (int32_t)(millis() - g_stallRecoverMs) < 0) return;
-  g_stallRecoverMs = 0;
+// Finish a motor-fault recovery: after the brief post-stop pause, re-enable and ramp back up to the
+// last commanded speed — but only while the Sun still wants motion and the cart is still online. (A
+// fresh command that arrives during the pause clears g_faultRecoverMs and restarts us itself.)
+static void serviceFaultRecover() {
+  if (!g_faultRecoverMs || (int32_t)(millis() - g_faultRecoverMs) < 0) return;
+  g_faultRecoverMs = 0;
   bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
   if (!wantMotion || g_state == ST_OFFLINE) return;
-  Serial.printf("stall recovery: re-accelerating to L=%.2f R=%.2f rpm\n", g_cmdWheelL, g_cmdWheelR);
+  Serial.printf("motor-fault recovery: re-accelerating to L=%.0f R=%.0f rpm\n", g_cmdWheelL, g_cmdWheelR);
   motorsEnable(true);
   wheelSetTargets(g_cmdWheelL, g_cmdWheelR);
 }
@@ -714,7 +717,7 @@ void loop() {
   serviceHoming();
   serviceRamp();
   serviceFaults();
-  serviceStallRecover();
+  serviceFaultRecover();
 
   // Periodic status transmit, jittered 1-3s to avoid collisions among the 8 carts.
   if (now >= g_nextStatusMs) {
@@ -743,7 +746,7 @@ void loop() {
     float rpmR = g_actHzR / (fullSteps * g_microsteps) * 60.0f * (g_velCurR < 0 ? -1 : 1);
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%d | "
                   "TMC:%s I=%umA usteps=%u %s%s sg=%u/%u ol=0x%02X | "
-                  "cmd L=%.2f R=%.2f rpm -> now L=%.2f R=%.2f rpm (%.0f/%.0f Hz) | "
+                  "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz) | "
                   "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? 1 : 0,

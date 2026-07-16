@@ -64,7 +64,8 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
     "wheels": {
       "diameter_mm": 36,
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
-                   "chopper_mode": "stealth", "microplyer": true, "stall_threshold": 0,
+                   "chopper_mode": "stealth", "microplyer": true,
+                   "stall_threshold": [10,10,10,10,10,10,10,10],
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
     },
     "rail": {
@@ -202,6 +203,16 @@ static void migrateSettings() {
     for (int k = 0; k < n; k++) out.add(vals[k]);
     changed = true;
     Serial.println("Migrated settings: inner_diameter_mm -> outer_diameter_mm (+2*width)");
+  }
+  // stall_threshold: scalar -> per-cart array. Spread the old scalar (or 10) across all 8 slots.
+  JsonObject st = g_settings["planets"]["wheels"]["stepper"].as<JsonObject>();
+  if (!st.isNull() && !st["stall_threshold"].isNull() && !st["stall_threshold"].is<JsonArray>()) {
+    uint16_t v = st["stall_threshold"] | 10;
+    st.remove("stall_threshold");
+    JsonArray arr = st["stall_threshold"].to<JsonArray>();
+    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) arr.add(v);
+    changed = true;
+    Serial.println("Migrated settings: stall_threshold scalar -> per-cart array");
   }
   if (changed) saveSettings();
 }
@@ -342,7 +353,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
-  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
+  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"][i] | 10;
   return m;
 }
 
@@ -355,7 +366,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
-  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
+  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"][i] | 10;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
     float outerD = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
