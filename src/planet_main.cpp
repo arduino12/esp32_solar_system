@@ -12,13 +12,21 @@
 // Motors: 2x TMC2209 on one single-wire UART bus (addresses 0/1). The planets do NOT spin
 // about their own axis (that motor was dropped) — they only roll around the rail and light up.
 //
-// Wheel drive uses the TMC2209's built-in constant-velocity generator (VACTUAL register) over
-// UART, NOT MCU-generated STEP pulses. On the single-core ESP32-C3, FastAccelStepper's RMT step
-// ISR is starved by the always-on Wi-Fi/ESP-NOW radio, which intermittently wedges the step
-// generator on restart (motor freezes mid-ramp until reboot). VACTUAL sidesteps that entirely:
-// the driver spins the motor from its own internal clock, so start/stop/restart is just a
-// register write and there is no 200 kHz step-rate ceiling (any microstep setting works). We
-// ramp VACTUAL up/down in software (serviceRamp) to get smooth ~1 s accel/decel.
+// STEP GENERATION: the ESP32-C3 LEDC peripheral (proven on the bench rig, stepper_test_main.cpp).
+// LEDC emits a hardware square wave on a GPIO at a set frequency — that square wave IS the STEP
+// signal. Two reasons this beats the alternatives on THIS cart:
+//   * vs FastAccelStepper (RMT): the RMT step ISR is starved by the always-on Wi-Fi/ESP-NOW
+//     radio on the single-core C3 and intermittently wedges on restart (motor freezes mid-ramp
+//     until reboot). LEDC is pure hardware — a busy CPU never interrupts the step train.
+//   * vs TMC VACTUAL: each driver's internal ~12 MHz oscillator runs free, so two VACTUAL motors
+//     drift apart. The two LEDC channels derive from the ONE 80 MHz APB clock, so the L:R
+//     frequency ratio is exact and drift-free — the cart rolls the circular rail without the
+//     wheels slipping. Direction = TMC shaft bit over UART (DIR pins tied to GND).
+//
+// Accel/decel is RATIO-PRESERVING: a single ramp fraction (0->1 over WHEEL_RAMP_S) scales BOTH
+// wheel targets together, so the commanded L:R speed ratio holds at every instant of the ramp
+// (e.g. R=300 L=356 stays 356:300 from standstill to full speed and back). Changing microsteps
+// while moving would jump the speed, so we ramp to a stop, apply at standstill, then ramp back up.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -31,8 +39,8 @@
 static const uint8_t PIN_TMC_EN     = 2;   // TMC enable, active-low (LOW = drivers on)
 static const uint8_t PIN_TMC_RX     = 4;   // Serial1 RX  <- driver PDN/UART bus
 static const uint8_t PIN_TMC_TX     = 3;   // Serial1 TX  -> driver PDN/UART bus (via 1k)
-static const uint8_t PIN_STEP_L     = 0;   // (unused with VACTUAL; STEP is generated inside TMC)
-static const uint8_t PIN_STEP_R     = 1;   // (unused with VACTUAL)
+static const uint8_t PIN_STEP_L     = 0;   // left  wheel STEP (LEDC ch 0 / timer0)
+static const uint8_t PIN_STEP_R     = 1;   // right wheel STEP (LEDC ch 2 / timer1)
 static const uint8_t PIN_MOTOR_PWR  = 5;   // (freed by dropping the spin motor) drives a high-side
                                            // MOSFET / load switch feeding VM to the TMC drivers.
                                            // HIGH = motor supply on; LOW = drivers fully asleep.
@@ -48,17 +56,19 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
 #define WHEEL_R_INVERT     true            // wheels are mounted back-to-back: flip the right one
                                            // so a "forward" command rolls both the same way.
-// TMC2209 internal oscillator (datasheet typical 12 MHz). VACTUAL speed:
-//   v[µsteps/s] = VACTUAL * fCLK / 2^24  ->  VACTUAL = v * 2^24 / fCLK.
-// If measured RPM is a few % off, trim TMC_FCLK (the internal clock varies part to part).
-#define TMC_FCLK           12000000.0f
-#define VACTUAL_PER_HZ     (16777216.0f / TMC_FCLK)   // µsteps/s -> VACTUAL register units
+// LEDC step generation. Channels must sit on DIFFERENT timers to run at independent speeds
+// (timer = channel/2, one frequency per timer): ch0->timer0, ch2->timer1. Both timers still
+// derive from the single 80 MHz APB clock, so the L:R frequency ratio stays exact (synchronized).
+#define LEDC_CH_L          0
+#define LEDC_CH_R          2
+#define LEDC_CLK_HZ        80000000.0      // APB clock feeding LEDC
 #define WHEEL_RAMP_S       1.0f            // seconds to accelerate 0->commanded speed (and back)
-#define VACTUAL_UPDATE_MS  20              // how often the software ramp pushes VACTUAL over UART
-// StallGuard load below this while a wheel is commanded to move = mechanically stuck.
-// TMC2209 StallGuard needs per-rig tuning; watch sgL/sgR in the serial heartbeat and set this
-// a little above the "held" reading but below the free-running reading. 0 disables the check.
-#define STALL_SG_MIN       0
+#define WHEEL_UPDATE_MS    20              // how often the software frequency ramp advances
+// StallGuard "stuck" detection uses a threshold sent from the Sun (settings: stall_threshold,
+// runtime g_stallThreshold): if the StallGuard load drops below it while a wheel is commanded to
+// move, the rotor is mechanically held. TMC2209 StallGuard needs per-rig tuning — watch sg=x/y in
+// the serial heartbeat / the Sun UI and set the threshold a little above the "held" reading but
+// below the free-running reading. 0 disables the check.
 #define FAULT_DEBOUNCE     3               // consecutive bad polls before a fault is latched
 
 // ----------------------------- Radio / power --------------------------------
@@ -72,8 +82,12 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 
 // Boot defaults (overwritten by the first command from the Sun).
 static uint16_t g_currentMa   = 200;       // current_amp=0.2 (RMS)
-static uint8_t  g_microsteps  = 16;
+static uint16_t g_microsteps  = 16;        // 1..256 (uint16: 256 does not fit in a byte)
 static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev = 360/step_degree
+static bool     g_spread      = false;     // chopper: false = stealthChop (quiet), true = spreadCycle
+static bool     g_interpolate = true;      // MicroPlyer: interpolate microsteps up to 256 internally
+static uint16_t g_stallThreshold = 0;      // StallGuard load below this while driving = stuck (0=off)
+static bool     g_cfgOk       = false;     // last applyDriverParams() verified over UART?
 
 HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
@@ -89,21 +103,26 @@ static bool     g_lightOn     = false;
 static bool     g_homingStop  = false;     // true while executing CMD_HOME_AND_STOP
 static uint8_t  g_error       = ERR_NONE;
 
-// Wheel velocity ramp (µsteps/s, signed = direction). serviceRamp() moves cur toward tgt at
-// g_rampRate and pushes the matching VACTUAL to each driver.
+// Wheel velocity ramp (µsteps/s, signed = direction). A SINGLE ramp fraction scales both wheels
+// from their start velocity to their final target, so the L:R speed ratio is preserved throughout
+// accel/decel. serviceRamp() advances the fraction and emits the matching LEDC frequency.
 static float    g_cmdWheelL   = 0;         // last commanded wheel rpm (for status/debug)
 static float    g_cmdWheelR   = 0;
-static float    g_velCurL = 0, g_velCurR = 0;   // current wheel velocity, µsteps/s
-static float    g_velTgtL = 0, g_velTgtR = 0;   // target  wheel velocity, µsteps/s
-static float    g_rampRate    = 1000.0f;   // µsteps/s^2, recomputed whenever a target is set
+static float    g_velCurL = 0, g_velCurR = 0;     // current wheel velocity, µsteps/s (signed)
+static float    g_velStartL = 0, g_velStartR = 0; // velocity at ramp start, µsteps/s (signed)
+static float    g_velFinalL = 0, g_velFinalR = 0; // target velocity, µsteps/s (signed)
+static float    g_rampFrac    = 1.0f;      // 0..1 shared ramp progress (1 = settled at target)
+static float    g_actHzL = 0, g_actHzR = 0;// actual LEDC frequency achieved (magnitude, Hz)
 static uint32_t g_rampMs      = 0;         // last ramp tick
 
 // Deferred actions triggered when the wheels have ramped to a stop.
 static bool     g_stopThenOff   = false;   // ramp to 0, then disable the drivers (CMD_STOP/homing)
-static bool     g_resumePending = false;   // ramp to 0, change microsteps, then ramp back up
-static float    g_pendingRpmL = 0, g_pendingRpmR = 0;   // rpm to resume with after a microstep change
-static uint8_t  g_pendingMicro  = 16;
+static bool     g_resumePending = false;   // ramp to 0, change params, then ramp back up
+static float    g_pendingRpmL = 0, g_pendingRpmR = 0;   // rpm to resume with after the change
+static uint16_t g_pendingMicro   = 16;
 static uint16_t g_pendingCurrent = 200;
+static bool     g_pendingSpread  = false;
+static bool     g_pendingInterp  = true;
 
 // Diagnostics reported back to the Sun and printed in the heartbeat.
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
@@ -166,29 +185,84 @@ static float rpmToUstepsHz(float rpm) {
 }
 
 // Round an arbitrary microstep request to the nearest valid TMC2209 value (power of two, 1..256).
-static uint8_t sanitizeMicrosteps(uint8_t m) {
-  const uint8_t valid[] = {1, 2, 4, 8, 16, 32, 64, 128, 255};  // 255 => 256 per TMCStepper
-  uint8_t best = 16; uint16_t bestErr = 0xFFFF;
-  for (uint8_t v : valid) {
+static uint16_t sanitizeMicrosteps(uint16_t m) {
+  const uint16_t valid[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+  uint16_t best = 16, bestErr = 0xFFFF;
+  for (uint16_t v : valid) {
     uint16_t e = (v > m) ? (v - m) : (m - v);
     if (e < bestErr) { bestErr = e; best = v; }
   }
   return best;
 }
 
-static void applyDriverParams() {
-  // Re-apply current/microsteps to both wheel drivers (called at boot and whenever they change).
-  // Low-heat standstill: hold current 0 + freewheel so a stopped-but-enabled motor dissipates
-  // almost nothing (planets never need to hold position precisely).
-  TMC2209Stepper *all[2] = {&drvL, &drvR};
-  for (auto *d : all) {
-    d->rms_current(g_currentMa, 0.0f);     // IRUN from mA; IHOLD = 0 (see freewheel below)
-    d->microsteps(g_microsteps);
-    d->intpol(g_microsteps >= 8);
-    d->en_spreadCycle(g_microsteps < 8);   // stealthChop at >=8, spreadCycle below
-    d->TPOWERDOWN(20);                      // ~0.4 s after stop, drop to standstill state
-    d->freewheel(1);                        // IHOLD=0 -> coils freewheel at standstill (no heat)
+// Write microsteps and VERIFY over UART. The TMCStepper library encodes full-step (1) as register
+// value 0 and has no setter case for 1, so map 1->0 on write; read the register back (0 means 1)
+// and retry up to 3x if a UART write was dropped. Returns the read-back value (1..256).
+static uint16_t setMicrostepsVerified(TMC2209Stepper &d, uint16_t want, uint8_t &tries) {
+  uint16_t reg  = (want <= 1) ? 0 : want;              // 1 microstep -> MRES value 0
+  uint16_t goal = (want <= 1) ? 1 : want;
+  for (tries = 1; tries <= 3; tries++) {
+    d.microsteps(reg);
+    uint16_t rb = d.microsteps(); if (rb == 0) rb = 1; // read-back: 0 means full-step (1)
+    if (rb == goal) return rb;
   }
+  uint16_t rb = d.microsteps(); if (rb == 0) rb = 1;
+  return rb;
+}
+
+// Emit a hardware square wave at f Hz on a STEP channel (f = step rate). Pick the LEDC resolution
+// so the clock divider stays <=1023 (well-conditioned -> accurate frequency, unlike ledcWriteTone's
+// fixed 10 bits which mis-divides fast tones). ledcSetup returns the frequency actually achieved.
+static void stepEmit(int ch, float f, float &actOut) {
+  if (f < 1.0f) { ledcWrite(ch, 0); actOut = 0; return; }   // duty 0 -> STEP held low
+  int res = 1;
+  while (res < 14 && (LEDC_CLK_HZ / (f * (double)(1u << res))) > 1023.0) res++;
+  uint32_t act = ledcSetup(ch, (uint32_t)(f + 0.5f), res);
+  ledcWrite(ch, (1u << res) / 2);                           // 50% duty at this resolution
+  actOut = act ? (float)act : f;
+}
+
+// Apply ALL driver params to one wheel and VERIFY they landed over UART, retrying the whole apply
+// up to `maxTries` times. Verification combines:
+//   * read-back of the RW registers (microsteps, MicroPlyer/intpol, chopper/en_spreadCycle) — these
+//     are read straight from the chip, so a mismatch means a dropped/garbled write; and
+//   * IFCNT, the driver's own received-frame counter, which must advance during the apply. IHOLD_IRUN
+//     (current), TPOWERDOWN and freewheel are write-only (no read-back), so IFCNT advancing is the
+//     proof those frames were received too.
+// Low-heat standstill: hold current 0 + freewheel, so a stopped-but-enabled motor barely dissipates
+// (planets never need to hold position precisely) — the requested hold = 0.
+static bool applyOneDriverVerified(TMC2209Stepper &d, char id, uint8_t maxTries) {
+  uint16_t goalUs = (g_microsteps <= 1) ? 1 : g_microsteps;
+  for (uint8_t attempt = 1; attempt <= maxTries; attempt++) {
+    uint8_t before = d.IFCNT();
+    d.rms_current(g_currentMa, 0.0f);       // IRUN from mA; IHOLD = 0 (see freewheel below)
+    uint8_t msTries;
+    setMicrostepsVerified(d, g_microsteps, msTries);   // maps 1->0, own inner read-back+retry
+    d.intpol(g_interpolate);                // MicroPlyer
+    d.en_spreadCycle(g_spread);             // false = stealthChop (quiet), true = spreadCycle
+    d.TPOWERDOWN(20);                        // ~0.3 s after stop, drop to standstill state
+    d.freewheel(1);                          // IHOLD=0 -> coils freewheel at standstill (no heat)
+    uint8_t ifDelta = (uint8_t)(d.IFCNT() - before);
+
+    uint16_t usRb = d.microsteps(); if (usRb == 0) usRb = 1;   // RW read-backs from the chip
+    bool intRb = d.intpol();
+    bool spRb  = d.en_spreadCycle();
+    bool ok = (usRb == goalUs) && (intRb == g_interpolate) && (spRb == g_spread) && (ifDelta > 0);
+    Serial.printf("apply %c try%u: usteps=%u(want %u) mplyer=%d(%d) spread=%d(%d) I=%umA IFCNT+%u => %s\n",
+                  id, attempt, usRb, goalUs, intRb, g_interpolate, spRb, g_spread,
+                  g_currentMa, ifDelta, ok ? "OK" : "RESEND");
+    if (ok) return true;
+  }
+  return false;
+}
+
+static void applyDriverParams() {
+  bool okL = applyOneDriverVerified(drvL, 'L', 3);
+  bool okR = applyOneDriverVerified(drvR, 'R', 3);
+  g_cfgOk = okL && okR;
+  Serial.printf("driver cfg %s: I=%umA usteps=%u mode=%s mplyer=%d stall_thr=%u\n",
+                g_cfgOk ? "VERIFIED" : "UNVERIFIED(!)", g_currentMa, g_microsteps,
+                g_spread ? "spread" : "stealth", g_interpolate, g_stallThreshold);
 }
 
 static void tmcBringup() {
@@ -200,7 +274,6 @@ static void tmcBringup() {
     d->pdn_disable(true);       // required so UART (not the PDN pin) controls the driver
     d->I_scale_analog(false);   // internal Vref (ignore VREF pin)
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
-    d->VACTUAL(0);              // ensure the internal velocity generator starts stopped
   }
   applyDriverParams();
 }
@@ -216,8 +289,9 @@ static void motorsEnable(bool on) {
     drvL.toff(4); drvR.toff(4);                 // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
   } else {
-    drvL.VACTUAL(0); drvR.VACTUAL(0);           // stop the internal velocity generators
-    g_velCurL = g_velCurR = 0; g_velTgtL = g_velTgtR = 0;
+    ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);   // STEP lines low: stop the step trains
+    g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
+    g_velFinalL = g_velFinalR = 0; g_actHzL = g_actHzR = 0; g_rampFrac = 1.0f;
     digitalWrite(PIN_TMC_EN, HIGH);             // disable outputs
     drvL.toff(0); drvR.toff(0);                 // chopper off
     digitalWrite(PIN_MOTOR_PWR, LOW);           // sleep: cut motor supply
@@ -234,50 +308,59 @@ static inline bool wheelsMoving() {
   return (fabsf(g_velCurL) > 1.0f) || (fabsf(g_velCurR) > 1.0f);
 }
 
-// Set new wheel velocity targets (µsteps/s, signed) and pick a ramp rate that reaches them in
-// ~WHEEL_RAMP_S seconds. The right wheel is inverted for the back-to-back mount.
-static void wheelSetTargets(float lHz, float rHz) {
-  g_velTgtL = lHz;
-  g_velTgtR = rHz * (WHEEL_R_INVERT ? -1.0f : 1.0f);
-  float span = fmaxf(fmaxf(fabsf(g_velTgtL), fabsf(g_velTgtR)),
-                     fmaxf(fabsf(g_velCurL), fabsf(g_velCurR)));
-  g_rampRate = fmaxf(span / WHEEL_RAMP_S, 100.0f);
+// Set new wheel velocity targets from signed rpm and restart the shared ramp fraction at 0. The
+// right wheel is inverted for the back-to-back mount. Because both wheels interpolate from their
+// start velocity to their final target on the SAME fraction, the L:R speed ratio is preserved for
+// the whole ramp (when starting from / ending at a stop, ratio == commanded ratio exactly).
+// Direction is the TMC shaft bit, set once here from the target sign (a stop keeps the last dir).
+static void wheelSetTargets(float lRpm, float rRpm) {
+  float lHz = rpmToUstepsHz(lRpm);                          // signed µsteps/s
+  float rHz = rpmToUstepsHz(rRpm) * (WHEEL_R_INVERT ? -1.0f : 1.0f);
+  if (fabsf(lHz) > 0.5f) drvL.shaft(lHz < 0);               // shaft bit selects direction
+  if (fabsf(rHz) > 0.5f) drvR.shaft(rHz < 0);
+  g_velStartL = g_velCurL; g_velStartR = g_velCurR;
+  g_velFinalL = lHz;       g_velFinalR = rHz;
+  g_rampFrac  = 0.0f;
 }
 
-static inline void approach(float &cur, float tgt, float step) {
-  if (cur < tgt) { cur += step; if (cur > tgt) cur = tgt; }
-  else if (cur > tgt) { cur -= step; if (cur < tgt) cur = tgt; }
-}
-
-// Software velocity ramp: nudge current velocity toward target and push VACTUAL to the drivers.
-// When the wheels reach a stop, run any deferred action (power-off, or microsteps-change resume).
+// Software frequency ramp: advance the shared fraction, compute each wheel's velocity, and emit
+// the matching LEDC frequency. The LEDC hardware keeps producing the square wave between updates,
+// so a busy CPU / Wi-Fi never interrupts the step train. When the wheels reach a full stop, run
+// any deferred action (power-off, or the microsteps/params-change resume).
 static void serviceRamp() {
   uint32_t now = millis();
-  if (now - g_rampMs < VACTUAL_UPDATE_MS) return;
+  if (now - g_rampMs < WHEEL_UPDATE_MS) return;
   float dt = (now - g_rampMs) / 1000.0f;
   g_rampMs = now;
 
-  float step = g_rampRate * dt;
-  approach(g_velCurL, g_velTgtL, step);
-  approach(g_velCurR, g_velTgtR, step);
+  if (g_rampFrac < 1.0f) {
+    g_rampFrac += dt / WHEEL_RAMP_S;               // fixed-time ramp -> preserves the L:R ratio
+    if (g_rampFrac > 1.0f) g_rampFrac = 1.0f;
+  }
+  g_velCurL = g_velStartL + g_rampFrac * (g_velFinalL - g_velStartL);
+  g_velCurR = g_velStartR + g_rampFrac * (g_velFinalR - g_velStartR);
 
   if (g_motorsOn) {
-    drvL.VACTUAL((uint32_t)(int32_t)lroundf(g_velCurL * VACTUAL_PER_HZ));
-    drvR.VACTUAL((uint32_t)(int32_t)lroundf(g_velCurR * VACTUAL_PER_HZ));
+    stepEmit(LEDC_CH_L, fabsf(g_velCurL), g_actHzL);
+    stepEmit(LEDC_CH_R, fabsf(g_velCurR), g_actHzR);
+  } else {
+    g_actHzL = g_actHzR = 0;
   }
 
-  bool stopped = (fabsf(g_velCurL) < 1.0f) && (fabsf(g_velCurR) < 1.0f);
-  if (!stopped) return;
+  bool stopped  = (fabsf(g_velCurL) < 1.0f) && (fabsf(g_velCurR) < 1.0f);
+  if (!(stopped && g_rampFrac >= 1.0f)) return;    // only act once fully ramped to a stop
 
-  if (g_resumePending) {                  // microsteps change: apply at standstill, then resume
+  if (g_resumePending) {                  // params change: apply at standstill, then re-accelerate
     g_resumePending = false;
     g_currentMa  = g_pendingCurrent;
     g_microsteps = g_pendingMicro;
+    g_spread     = g_pendingSpread;
+    g_interpolate = g_pendingInterp;
     applyDriverParams();
-    Serial.printf("microsteps applied=%u at standstill; re-accelerating to L=%.0f R=%.0f rpm\n",
+    Serial.printf("params applied at standstill (usteps=%u); re-accelerating to L=%.0f R=%.0f rpm\n",
                   g_microsteps, g_pendingRpmL, g_pendingRpmR);
     g_cmdWheelL = g_pendingRpmL; g_cmdWheelR = g_pendingRpmR;
-    wheelSetTargets(rpmToUstepsHz(g_pendingRpmL), rpmToUstepsHz(g_pendingRpmR));
+    wheelSetTargets(g_pendingRpmL, g_pendingRpmR);
   } else if (g_stopThenOff && g_motorsOn) {   // ramped to a stop for CMD_STOP / homing: cut power
     g_stopThenOff = false;
     motorsEnable(false);
@@ -324,10 +407,15 @@ static void serviceCommand() {
 
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
+  g_stallThreshold = m.stall_threshold;     // stuck-detection threshold (0 = disabled)
 
-  uint8_t effUs = sanitizeMicrosteps(m.microsteps);
-  bool microChanged  = (effUs != g_microsteps);
+  uint16_t effUs = sanitizeMicrosteps(m.microsteps);
+  bool spread = (m.chopper_mode != 0);
+  bool interp = (m.interpolate != 0);
+  bool microChanged   = (effUs != g_microsteps);
   bool currentChanged = (m.current_ma != g_currentMa);
+  bool chopChanged    = (spread != g_spread) || (interp != g_interpolate);
+  bool paramsChanged  = microChanged || currentChanged || chopChanged;
 
   switch (m.command) {
     case CMD_STOP:
@@ -339,37 +427,47 @@ static void serviceCommand() {
 
     case CMD_RUN:
       g_homingStop = false; g_stopThenOff = false;
-      // Changing microsteps while turning would jump the speed; decelerate to a stop, change it at
-      // standstill, then re-accelerate (serviceRamp completes the sequence). Safe & reliable with
-      // VACTUAL — no step-generator restart involved.
+      // Changing microsteps while turning would jump the speed; decelerate to a stop, apply the new
+      // params at standstill, then re-accelerate (serviceRamp completes the sequence). Reliable with
+      // LEDC — no step-generator restart involved. (Current/chopper/MicroPlyer alone don't jump the
+      // speed, so those are applied live below without stopping.)
       if (microChanged && wheelsMoving()) {
         Serial.printf("microsteps %u->%u while running: STOP, apply, then re-accelerate\n",
                       g_microsteps, effUs);
         g_resumePending = true;
         g_pendingMicro = effUs; g_pendingCurrent = m.current_ma;
+        g_pendingSpread = spread; g_pendingInterp = interp;
         g_pendingRpmL = m.wheel_l_rpm; g_pendingRpmR = m.wheel_r_rpm;
         wheelSetTargets(0, 0);
       } else if (!g_resumePending) {
-        if (currentChanged || microChanged) {
-          g_currentMa = m.current_ma; g_microsteps = effUs; applyDriverParams();
+        if (paramsChanged) {
+          g_currentMa = m.current_ma; g_microsteps = effUs;
+          g_spread = spread; g_interpolate = interp;
+          applyDriverParams();
         }
-        if (!g_motorsOn) motorsEnable(true);
+        bool wasOff = !g_motorsOn;
+        if (wasOff) motorsEnable(true);
+        // The Sun re-sends the same CMD_RUN every ~2 s as a heartbeat; only (re)start the ramp on a
+        // genuine speed change (or a fresh enable), so an identical heartbeat doesn't reset it.
+        bool targetChanged = wasOff || (m.wheel_l_rpm != g_cmdWheelL) || (m.wheel_r_rpm != g_cmdWheelR);
         g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-        wheelSetTargets(rpmToUstepsHz(m.wheel_l_rpm), rpmToUstepsHz(m.wheel_r_rpm));
+        if (targetChanged) wheelSetTargets(m.wheel_l_rpm, m.wheel_r_rpm);
       }
       lightSet(m.light_on);
       break;
 
     case CMD_HOME_AND_STOP:           // drive slowly toward HOME; homing logic stops on the pulse
       g_resumePending = false; g_stopThenOff = false;
-      if (currentChanged || microChanged) {
-        g_currentMa = m.current_ma; g_microsteps = effUs; applyDriverParams();
+      if (paramsChanged) {
+        g_currentMa = m.current_ma; g_microsteps = effUs;
+        g_spread = spread; g_interpolate = interp;
+        applyDriverParams();
       }
       if (!g_homingStop) g_homeSeen = false;    // clear on entry only, not every heartbeat
       g_homingStop = true;
       if (!g_motorsOn) motorsEnable(true);
       g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
-      wheelSetTargets(rpmToUstepsHz(m.wheel_l_rpm), rpmToUstepsHz(m.wheel_r_rpm));
+      wheelSetTargets(m.wheel_l_rpm, m.wheel_r_rpm);
       lightSet(m.light_on);
       break;
 
@@ -391,6 +489,8 @@ static void sendStatus() {
   g_dieTempC     = readDieTempC();
   s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
   s.rssi         = g_sunRssi;
+  s.cfg_ok       = g_cfgOk ? 1 : 0;
+  s.sg_load      = (g_sgL < g_sgR) ? g_sgL : g_sgR;   // worst-case (lowest) wheel load
   g_homePulse    = false;
 
   const uint8_t *dst = g_sunKnown ? g_sunMac : BCAST_MAC;
@@ -463,10 +563,10 @@ static void serviceFaults() {
   bool openLoad = driving && (g_drvStat & 0x0F);       // a coil open while being driven
   bool disc     = commsBad || openLoad;
 
-  // Stuck: commanded to move but StallGuard load collapses (rotor physically held).
-  // Off by default (STALL_SG_MIN==0) until tuned against the real rig — see the #define.
-  bool stuck = (STALL_SG_MIN > 0) && driving && !disc &&
-               ((g_sgL < STALL_SG_MIN) || (g_sgR < STALL_SG_MIN));
+  // Stuck: commanded to move but StallGuard load collapses (rotor physically held). The threshold
+  // comes from the Sun (g_stallThreshold); 0 disables it until tuned against the real rig.
+  bool stuck = (g_stallThreshold > 0) && driving && !disc &&
+               ((g_sgL < g_stallThreshold) || (g_sgR < g_stallThreshold));
 
   discCnt  = disc  ? (uint8_t)(discCnt  + 1) : 0;
   stuckCnt = stuck ? (uint8_t)(stuckCnt + 1) : 0;
@@ -496,7 +596,7 @@ static void serviceButton() {
     g_selfTestEndMs = millis() + 5000;
     motorsEnable(true);                 // jog both wheels slowly + light: a lone-cart self-test
     g_cmdWheelL = 60; g_cmdWheelR = 60;
-    wheelSetTargets(rpmToUstepsHz(60), rpmToUstepsHz(60));
+    wheelSetTargets(60, 60);
     lightSet(true);
   }
   if (g_selfTest && millis() > g_selfTestEndMs) {
@@ -529,8 +629,11 @@ void setup() {
 
   pinMode(PIN_MOTOR_PWR, OUTPUT);  digitalWrite(PIN_MOTOR_PWR, LOW);  // motor supply asleep
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
-  pinMode(PIN_STEP_L, OUTPUT);     digitalWrite(PIN_STEP_L, LOW);    // unused with VACTUAL
-  pinMode(PIN_STEP_R, OUTPUT);     digitalWrite(PIN_STEP_R, LOW);
+  // LEDC step generation: each STEP pin on a channel of its own timer (ch0/timer0, ch2/timer1),
+  // both off the one 80 MHz clock so the two wheels stay frequency-synchronized. stepEmit() later
+  // sets the actual step rate with a per-frequency resolution for accuracy; start silent (duty 0).
+  ledcSetup(LEDC_CH_L, 1000, 8); ledcAttachPin(PIN_STEP_L, LEDC_CH_L); ledcWrite(LEDC_CH_L, 0);
+  ledcSetup(LEDC_CH_R, 1000, 8); ledcAttachPin(PIN_STEP_R, LEDC_CH_R); ledcWrite(LEDC_CH_R, 0);
   pinMode(PIN_LIGHT_EN, OUTPUT);   digitalWrite(PIN_LIGHT_EN, LOW);
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);
   pinMode(PIN_HOME, INPUT_PULLUP);
@@ -585,20 +688,22 @@ void loop() {
     g_dieTempC = readDieTempC();
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
     bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
-    // Current wheel velocities in µsteps/s and the equivalent rpm, so a bench check can confirm
-    // the motor is actually turning at the commanded speed (VACTUAL, no external step pin).
+    // Current wheel velocities and the equivalent rpm derived from the ACTUAL emitted LEDC step
+    // frequency, so a bench check (scope on STEP) can confirm the motor turns at the commanded
+    // speed and that the L:R ratio holds throughout the ramp.
     float fullSteps = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
-    float rpmL = g_velCurL / (fullSteps * g_microsteps) * 60.0f;
-    float rpmR = g_velCurR / (fullSteps * g_microsteps) * 60.0f;
+    float rpmL = g_actHzL / (fullSteps * g_microsteps) * 60.0f * (g_velCurL < 0 ? -1 : 1);
+    float rpmR = g_actHzR / (fullSteps * g_microsteps) * 60.0f * (g_velCurR < 0 ? -1 : 1);
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
-                  "TMC:%s I=%umA usteps=%u %.1fdeg sg=%u/%u ol=0x%02X | "
-                  "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f ustep/s) | "
+                  "TMC:%s I=%umA usteps=%u %s mplyer=%d %.1fdeg sg=%u/%u ol=0x%02X | "
+                  "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz f=%.2f) | "
                   "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
-                  errText(g_error), g_currentMa, g_microsteps, g_stepDegree,
+                  errText(g_error), g_currentMa, g_microsteps,
+                  g_spread ? "spread" : "stealth", g_interpolate, g_stepDegree,
                   g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
-                  rpmL, rpmR, g_velCurL, g_velCurR,
+                  rpmL, rpmR, g_actHzL, g_actHzR, g_rampFrac,
                   g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }

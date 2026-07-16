@@ -77,7 +77,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="mode" id="mode">--</div>
 <div class="timer" id="timer">00:00:00</div>
 <svg viewBox="0 0 400 400" id="sky"></svg>
-<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Fault</th></tr></thead>
+<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>Load</th><th>Fault</th></tr></thead>
 <tbody id="ptab"></tbody></table>
 <div id="log"></div>
 </div>
@@ -186,8 +186,10 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   const tc=pl.online?pl.temp_c:null;
   const temp=tc==null?'—':('<span class="'+(tc>=70?'hot':'')+'">'+tc+'&deg;C</span>');
   const fault=pl.error?('<span class="er">'+(ERRTXT[pl.error]||('err '+pl.error))+'</span>'):(pl.online?'ok':'—');
+  const cfg=!pl.online?'—':(pl.cfg_ok?'ok':'<span class="er">CHECK</span>');
+  const load=pl.online?(pl.sg_load):'—';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
-   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+fault+'</td></tr>';
+   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+load+'</td><td>'+fault+'</td></tr>';
  });
  $('#ptab').innerHTML=rows;
  $('#log').textContent=(d.log||[]).join('\n');
@@ -205,11 +207,19 @@ function mkInput(v,path){
  return inp;
 }
 const MICROSTEPS=[1,2,4,8,16,32,64,128,256];
-function mkSelect(v,path,opts){                 // restrict a value to a fixed option set
+const CHOPPER=['stealth','spread'];
+function mkSelect(v,path,opts){                 // restrict a value to a fixed numeric option set
  const sel=document.createElement('select');
  opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
   if(+o===+v)op.selected=true;sel.appendChild(op)});
  sel.onchange=()=>setPath(cfg,path,parseInt(sel.value));
+ return sel;
+}
+function mkSelectStr(v,path,opts){              // restrict a value to a fixed string option set
+ const sel=document.createElement('select');
+ opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
+  if(o===v)op.selected=true;sel.appendChild(op)});
+ sel.onchange=()=>setPath(cfg,path,sel.value);
  return sel;
 }
 function render(key,val,path){
@@ -217,6 +227,11 @@ function render(key,val,path){
   const f=document.createElement('div');f.className='f';
   const l=document.createElement('label');l.textContent=key;
   f.appendChild(l);f.appendChild(mkSelect(val,path,MICROSTEPS));return f;
+ }
+ if(key==='chopper_mode'&&typeof val==='string'){
+  const f=document.createElement('div');f.className='f';
+  const l=document.createElement('label');l.textContent=key;
+  f.appendChild(l);f.appendChild(mkSelectStr(val,path,CHOPPER));return f;
  }
  if(key==='mac_address'&&Array.isArray(val)){   // one labelled line per planet
   const fs=document.createElement('fieldset');const lg=document.createElement('legend');

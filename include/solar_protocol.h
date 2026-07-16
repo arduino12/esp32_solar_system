@@ -49,8 +49,11 @@ struct __attribute__((packed)) CmdMsg {
   float    wheel_r_rpm;   // right wheel (inner track); sign = direction
   uint8_t  light_on;      // 0/1
   uint16_t current_ma;    // TMC rms current to apply to all drivers
-  uint8_t  microsteps;    // TMC microsteps (must be a valid power of 2: 1,2,4,...,256)
+  uint16_t microsteps;    // TMC microsteps (valid power of 2: 1,2,4,...,256 — 256 needs 16 bits)
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
+  uint8_t  chopper_mode;  // 0 = stealthChop (quiet), 1 = spreadCycle (more torque/noise)
+  uint8_t  interpolate;   // MicroPlyer: 1 = interpolate microsteps up to 256 internally
+  uint16_t stall_threshold; // StallGuard load below this while driving = stuck (0 = disabled)
 };
 
 // Planet -> Sun. Broadcast until the Sun's MAC is learned, then unicast to it.
@@ -64,6 +67,8 @@ struct __attribute__((packed)) StatusMsg {
   uint8_t  moving;        // 1 if any wheel motor is currently running
   int8_t   temp_c;        // ESP32-C3 internal die temperature, °C (INT8_MIN = unknown)
   int8_t   rssi;          // last measured Sun-AP signal, dBm (0 = unknown)
+  uint8_t  cfg_ok;        // 1 = last driver-param apply verified over UART (read-back + IFCNT)
+  uint16_t sg_load;       // last StallGuard load reading (min of both wheels; for tuning)
 };
 
 #define PLANET_INDEX_UNKNOWN 0xFF

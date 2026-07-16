@@ -64,6 +64,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
     "wheels": {
       "diameter_mm": 36,
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
+                   "chopper_mode": "stealth", "microplyer": true, "stall_threshold": 0,
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
     },
     "rail": {
@@ -97,6 +98,8 @@ struct PlanetState {
   float    orbitalRpm;    // signed; Sun-computed for the web animation
   int8_t   tempC;         // planet die temperature, °C (reported by the cart)
   int8_t   rssi;          // planet<->Sun signal, dBm (reported by the cart)
+  bool     cfgOk;         // planet verified its last driver-param apply over UART
+  uint16_t sgLoad;        // planet's last StallGuard load reading (for stall tuning)
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
 
@@ -250,6 +253,10 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   p.moving     = s.moving;
   p.tempC      = s.temp_c;
   p.rssi       = s.rssi;
+  if (!s.cfg_ok && p.cfgOk)             // config verification just failed on the cart
+    addLog("Planet " + String(idx) + " driver cfg UNVERIFIED (UART)");
+  p.cfgOk      = s.cfg_ok;
+  p.sgLoad     = s.sg_load;
   if (s.home_pulsed) p.homeCount++;
   if (s.error != p.error && s.error != ERR_NONE)
     addLog("Planet " + String(idx) + (s.error == ERR_MOTOR_DISCONNECTED ? " motor disconnected"
@@ -308,6 +315,9 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.microsteps  = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
+  m.chopper_mode = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread") ? 1 : 0;
+  m.interpolate  = (pl["wheels"]["stepper"]["microplyer"] | true) ? 1 : 0;
+  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
   return m;
 }
 
@@ -320,6 +330,9 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.microsteps = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
+  m.chopper_mode = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread") ? 1 : 0;
+  m.interpolate  = (pl["wheels"]["stepper"]["microplyer"] | true) ? 1 : 0;
+  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
     float dWheel = pl["wheels"]["diameter_mm"] | 36.0f;
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
@@ -565,6 +578,8 @@ static void buildStatusJson(String &out) {
       int r = g_planet[i].rssi;
       o["rssi"]     = r;
       o["rssi_pct"] = r ? constrain(2 * (r + 100), 0, 100) : 0;   // -100dBm=0%, -50dBm=100%
+      o["cfg_ok"]   = g_planet[i].cfgOk;
+      o["sg_load"]  = g_planet[i].sgLoad;
     }
   }
 
