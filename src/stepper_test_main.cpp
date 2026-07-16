@@ -65,6 +65,7 @@ struct MotorCfg {
   float    accelRpmS  = 300.0f;   // acceleration in rpm per second
   float    decelRpmS  = 300.0f;   // deceleration in rpm per second
   bool     spread     = false;    // false = stealthChop (quiet), true = spreadCycle
+  bool     interpolate = true;    // MicroPlyer: interpolate microsteps up to 256 internally
   float    speedRpm   = 60.0f;    // target speed
   bool     dirCW      = true;     // requested direction
   bool     run        = false;    // should this motor be running
@@ -126,7 +127,7 @@ static void applyDriver(int i) {
   uint8_t before = d.IFCNT();
   d.rms_current(c.currentMa, 0.0f);
   w.ustepsRead   = setMicrostepsVerified(d, c.microsteps, w.usTries);
-  d.intpol(c.microsteps >= 8);
+  d.intpol(c.interpolate);              // MicroPlyer: smooth 256-microstep output from low usteps
   d.en_spreadCycle(c.spread);
   d.TPOWERDOWN(20);
   d.freewheel(1);
@@ -135,9 +136,9 @@ static void applyDriver(int i) {
   w.ifcntDelta   = (uint8_t)(after - before);
   w.ustepsWanted = c.microsteps;
   w.checked      = true;
-  Serial.printf("apply M%d: usteps want=%u read=%u (tries %u), IFCNT+%u, I=%umA mode=%s\n",
+  Serial.printf("apply M%d: usteps want=%u read=%u (tries %u), IFCNT+%u, I=%umA mode=%s microplyer=%d\n",
                 i, w.ustepsWanted, w.ustepsRead, w.usTries, w.ifcntDelta, c.currentMa,
-                c.spread ? "spread" : "stealth");
+                c.spread ? "spread" : "stealth", c.interpolate);
 }
 
 static void tmcBringup() {
@@ -243,6 +244,7 @@ static void buildStatus(String &out) {
     cf["accel"]      = c.accelRpmS;
     cf["decel"]      = c.decelRpmS;
     cf["mode"]       = c.spread ? "spread" : "stealth";
+    cf["microplyer"] = c.interpolate;
     cf["dir"]        = c.dirCW ? "CW" : "CCW";
     cf["run"]        = c.run;
 
@@ -262,6 +264,7 @@ static void buildStatus(String &out) {
     t["sg"]      = dd.SG_RESULT();
     t["stst"]    = dd.stst();
     t["stealth"] = dd.stealth();
+    t["intpol"]  = dd.intpol();          // MicroPlyer state read back from CHOPCONF
     t["ola"]     = dd.ola();
     t["olb"]     = dd.olb();
     t["s2ga"]    = dd.s2ga();
@@ -319,6 +322,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
  <div class=row><label>Accel (rpm/s)</label><input id=accel type=number value=300>
    <label>Decel (rpm/s)</label><input id=decel type=number value=300>
    <label>Chopper</label><select id=mode><option value=stealth selected>stealthChop (quiet)</option><option value=spread>spreadCycle (normal)</option></select>
+   <label>MicroPlyer</label><select id=microplyer><option value=1 selected>on (interp. to 256)</option><option value=0>off</option></select>
  </div>
 </div>
 
@@ -348,7 +352,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <script>
 const $=id=>document.getElementById(id);
 function cfg(){return{microsteps:+$('microsteps').value,current_ma:+$('current_ma').value,
-  step_degree:+$('step_degree').value,accel:+$('accel').value,decel:+$('decel').value,mode:$('mode').value};}
+  step_degree:+$('step_degree').value,accel:+$('accel').value,decel:+$('decel').value,
+  mode:$('mode').value,microplyer:$('microplyer').value=='1'};}
 function motor(m){return{speed:+$(m+'speed').value,dir:$(m+'dir').value};}
 function post(p,o){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}
 function en(on){post('/api/enable',{on:!!on});}
@@ -371,6 +376,7 @@ function fill(el,m,t){
   h+=row('StallGuard',t.sg+(m.running&&t.sg==0?' <span class=bad>(stuck?)</span>':''));
   h+=row('standstill',b(t.stst));
   h+=row('mode',t.stealth?'stealthChop':'spreadCycle');
+  h+=row('MicroPlyer (set/read)',chk(m.cfg.microplyer?'on':'off',t.intpol?'on':'off'));
   h+=row('open load A/B',flag(t.ola)+' / '+flag(t.olb));
   h+=row('short GND A/B',flag(t.s2ga)+' / '+flag(t.s2gb));
   h+=row('over-temp / pre-warn',flag(t.ot)+' / '+flag(t.otpw));
@@ -402,6 +408,7 @@ static void ingest(JsonVariant &j) {
       g_cfg[i].accelRpmS  = c["accel"]      | g_cfg[i].accelRpmS;
       g_cfg[i].decelRpmS  = c["decel"]      | g_cfg[i].decelRpmS;
       g_cfg[i].spread     = String((const char*)(c["mode"] | "stealth")) == "spread";
+      if (!c["microplyer"].isNull()) g_cfg[i].interpolate = c["microplyer"].as<bool>();
     }
   }
   JsonObject L = j["L"], R = j["R"];
@@ -499,9 +506,9 @@ void loop() {
     for (int i = 0; i < 2; i++) {
       TMC2209Stepper &dd = drv(i);
       uint16_t usRb = dd.microsteps(); if (usRb == 0) usRb = 1;
-      Serial.printf("M%c[%s hz=%.0f us=%u dir=%s I=%umA sg=%u ifc=%u wr:%s] ",
+      Serial.printf("M%c[%s hz=%.0f us=%u mp=%d dir=%s I=%umA sg=%u ifc=%u wr:%s] ",
                     i ? 'R' : 'L', dd.test_connection() == 0 ? "conn" : "DISC",
-                    g_actHz[i], usRb, dd.shaft() ? "CCW" : "CW", dd.cs2rms(dd.cs_actual()),
+                    g_actHz[i], usRb, dd.intpol(), dd.shaft() ? "CCW" : "CW", dd.cs2rms(dd.cs_actual()),
                     dd.SG_RESULT(), dd.IFCNT(),
                     g_wc[i].checked && g_wc[i].ustepsRead == g_wc[i].ustepsWanted ? "ok" : "?");
     }
