@@ -152,6 +152,8 @@ static void tmcBringup() {
     d.pdn_disable(true);
     d.I_scale_analog(false);
     d.mstep_reg_select(true);
+    d.pwm_autoscale(true);      // StealthChop auto current regulation (needed for open-load sensing)
+    d.pwm_autograd(true);
     applyDriver(i);
   }
 }
@@ -263,7 +265,20 @@ static void buildStatus(String &out) {
     t["dir_rb"]  = shaftRb ? "CCW" : "CW";               // direction read back from GCONF
     uint16_t cs  = dd.cs_actual();
     t["cs_actual"] = cs;
-    t["irms_rb"] = dd.cs2rms(cs);                        // actual RMS current (mA) while driving
+    // Open-load / disconnected coil. cs_actual is only the SETPOINT scale (identical whether or not
+    // a coil is connected), so it can't tell us if current actually flows. Instead watch the
+    // StealthChop PWM autoscaler: with an open winding it can't reach the target current, so
+    // PWM_SCALE_SUM pins at its 255 ceiling AND PWM_SCALE_AUTO rails high. In SpreadCycle use OLA/OLB.
+    uint8_t ps  = dd.pwm_scale_sum();
+    int16_t pa  = dd.pwm_scale_auto();
+    bool moving = g_actHz[i] > 1.0f;
+    bool openLoad = moving && (c.spread ? (dd.ola() || dd.olb())
+                                        : (ps >= 250 && pa >= 100));
+    t["pwm_sum"]  = ps;
+    t["pwm_auto"] = pa;
+    t["open"]     = openLoad;
+    // Delivered current: an open coil carries ~0 mA regardless of the commanded scale.
+    t["irms_rb"] = openLoad ? 0 : dd.cs2rms(cs);
     t["sg"]      = dd.SG_RESULT();
     t["stst"]    = dd.stst();
     t["stealth"] = dd.stealth();
@@ -376,7 +391,9 @@ function fill(el,m,t){
   h+=row('version','0x'+t.version.toString(16)+(t.version==0x21?' <span class=ok>(TMC2209)</span>':' <span class=bad>?</span>'));
   h+=row('microsteps (set/read)',chk(m.cfg.microsteps,t.usteps_rb));
   h+=row('direction (set/read)',chk(m.cfg.dir,t.dir_rb));
-  h+=row('current set / read',m.cfg.current_ma+' mA (hold '+m.cfg.hold_pct+'%) / <b>'+t.irms_rb+' mA</b> <span style="color:#888">(cs '+t.cs_actual+')</span>');
+  h+=row('current set / delivered',m.cfg.current_ma+' mA (hold '+m.cfg.hold_pct+'%) / <b>'+t.irms_rb+' mA</b>'+(t.open?' <span class=bad>(open load!)</span>':''));
+  h+=row('coil',t.open?'<span class=bad>OPEN LOAD / DISCONNECTED</span>':'<span class=ok>connected</span>')+
+     '<tr><td>PWM scale sum/auto</td><td><span style="color:#888">'+t.pwm_sum+' / '+t.pwm_auto+'</span></td></tr>';
   h+=row('StallGuard',t.sg+(m.running&&t.sg==0?' <span class=bad>(stuck?)</span>':''));
   h+=row('standstill',b(t.stst));
   h+=row('mode',t.stealth?'stealthChop':'spreadCycle');

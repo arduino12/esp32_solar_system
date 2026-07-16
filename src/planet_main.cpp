@@ -77,6 +77,16 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define SG_AVG_ALPHA       0.30f           // EMA weight per fault poll (higher = reacts faster)
 #define SG_AVG_INIT_MULT   5               // arm the average at this * stall_threshold
 #define STALL_RESTART_MS   800             // pause after the hard stop before spinning up again
+// Open-load / disconnected-motor detection. A single SG_RESULT sample and the OLA/OLB flags are
+// unreliable at low RPM (they flicker), so we watch the StealthChop auto-current regulator instead:
+// with an open winding it CANNOT reach the commanded current, so PWM_SCALE_SUM pins at its 255
+// ceiling and PWM_SCALE_AUTO rails high. A connected coil regulates with a small, bounded auto term
+// at any speed. Measured on the rig (400 mA, 50 rpm): connected sum 44-166 / auto -39..+30 ;
+// disconnected sum 255 / auto 152-223. Requiring BOTH avoids a high-speed false positive (where a
+// connected coil's sum can rise while auto stays low). In SpreadCycle, OLA/OLB are used (reliable
+// there while moving) since PWM autoscale is a StealthChop feature.
+#define PWM_OPEN_SUM       250             // PWM_SCALE_SUM at/above this (near 255 ceiling) = saturated
+#define PWM_OPEN_AUTO      100             // and PWM_SCALE_AUTO railed this high = can't reach current
 
 // ----------------------------- Radio / power --------------------------------
 // The C3 runs warm because its Wi-Fi radio is always on for ESP-NOW. Two levers reduce it:
@@ -272,6 +282,8 @@ static void tmcBringup() {
     d->pdn_disable(true);       // required so UART (not the PDN pin) controls the driver
     d->I_scale_analog(false);   // internal Vref (ignore VREF pin)
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
+    d->pwm_autoscale(true);     // StealthChop auto current regulation (needed for open-load sensing)
+    d->pwm_autograd(true);
   }
   applyDriverParams();
 }
@@ -543,6 +555,16 @@ static void serviceStatusLed() {
   digitalWrite(PIN_STATUS_LED, on ? LOW : HIGH);        // active-low
 }
 
+// Is this driver's winding open (motor disconnected / broken coil) while it is being driven?
+// StealthChop: the PWM autoscaler saturates (sum pinned at the 255 ceiling AND the auto term
+// railed) because it cannot force the commanded current into an open coil. SpreadCycle: fall back
+// to the OLA/OLB flags, which are reliable there while moving (PWM autoscale is StealthChop-only).
+static bool coilOpen(TMC2209Stepper &d, bool moving) {
+  if (!moving) return false;                           // only meaningful while the coil is driven
+  if (g_spread) return d.ola() || d.olb();
+  return (d.pwm_scale_sum() >= PWM_OPEN_SUM) && (d.pwm_scale_auto() >= PWM_OPEN_AUTO);
+}
+
 // A motor fault (StallGuard stall OR a disconnect/open-load) means we can't trust the motion. Stop
 // the cart INSTANTLY (no decel ramp): kill both step trains and disable the drivers, report the
 // fault right away, then schedule a fresh spin-up (as if a new RUN arrived) as long as the Sun
@@ -581,24 +603,28 @@ static void serviceFaults() {
     return;
   }
   bool driving = g_motorsOn && wheelsMoving();
+  bool lMoving = fabsf(g_velCurL) > 1.0f;
+  bool rMoving = fabsf(g_velCurR) > 1.0f;
 
-  // Snapshot StallGuard load + open-load/overtemp flags for the heartbeat and tuning.
+  // Snapshot StallGuard load for the stall average/heartbeat.
   g_sgL = drvL.SG_RESULT();
   g_sgR = drvR.SG_RESULT();
-  g_drvStat = (driving && drvL.ola() ? 0x01 : 0) | (driving && drvL.olb() ? 0x02 : 0) |
-              (driving && drvR.ola() ? 0x04 : 0) | (driving && drvR.olb() ? 0x08 : 0) |
+
+  // Disconnected motor / open winding, sensed per wheel via the StealthChop PWM autoscaler (see
+  // coilOpen). Reliable down to low RPM, unlike the OLA/OLB flags we used before. Also latch the
+  // over-temp flags into g_drvStat for the heartbeat/UI.
+  bool openL = coilOpen(drvL, lMoving);
+  bool openR = coilOpen(drvR, rMoving);
+  g_drvStat = (openL ? 0x01 : 0) | (openR ? 0x04 : 0) |
               (drvL.ot() ? 0x10 : 0) | (drvR.ot() ? 0x20 : 0);
 
   bool commsBad = (drvL.test_connection() != 0) || (drvR.test_connection() != 0);
-  bool openLoad = driving && (g_drvStat & 0x0F);       // a coil open while being driven
-  bool disc     = commsBad || openLoad;
+  bool disc     = commsBad || openL || openR;
 
   // Running StallGuard average per wheel. SG_RESULT is noisy and reads low at low RPM, so we only
   // fold samples into the EMA once the wheel is AT its commanded speed (ramp settled); during the
   // accel ramp the average stays parked at its high init value (no false trips while speeding up).
   bool atSpeed = driving && (g_rampFrac >= 1.0f);
-  bool lMoving = fabsf(g_velCurL) > 1.0f;
-  bool rMoving = fabsf(g_velCurR) > 1.0f;
   if (atSpeed && lMoving) g_sgAvgL += SG_AVG_ALPHA * ((float)g_sgL - g_sgAvgL);
   if (atSpeed && rMoving) g_sgAvgR += SG_AVG_ALPHA * ((float)g_sgR - g_sgAvgR);
 
