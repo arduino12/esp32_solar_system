@@ -39,20 +39,40 @@ enum PlanetErr : uint8_t {
   ERR_MOTOR_STUCK,          // commanded to move but no motion / stall detected
 };
 
+// ------------------------ Packed driver-config byte -------------------------
+// CmdMsg.driver_cfg carries all three per-move TMC parameters in one uint8:
+//   bits [0..3]  microsteps as an enum = log2(microsteps): 0->1, 1->2, ... 8->256
+//   bit  [4]     chopper mode: 0 = stealthChop (quiet), 1 = spreadCycle (torque/noise)
+//   bit  [5]     MicroPlyer: 1 = interpolate microsteps up to 256 internally
+#define SOLAR_DRVCFG_CHOP    0x10
+#define SOLAR_DRVCFG_INTERP  0x20
+
+static inline uint8_t solarMicrostepsToEnum(uint16_t m) {
+  uint8_t e = 0;
+  while (m > 1 && e < 8) { m >>= 1; e++; }        // 1->0, 2->1, ... 256->8
+  return e;
+}
+static inline uint16_t solarMicrostepsFromEnum(uint8_t e) {
+  return (uint16_t)1u << (e & 0x0F);              // 0->1, 1->2, ... 8->256
+}
+static inline uint8_t solarPackDriverCfg(uint16_t microsteps, bool spread, bool interpolate) {
+  return (uint8_t)((solarMicrostepsToEnum(microsteps) & 0x0F) |
+                   (spread      ? SOLAR_DRVCFG_CHOP   : 0) |
+                   (interpolate ? SOLAR_DRVCFG_INTERP : 0));
+}
+
 // Sun -> Planet, unicast to the planet's MAC.
 struct __attribute__((packed)) CmdMsg {
   uint8_t  magic;         // = SOLAR_MAGIC
   uint8_t  type;          // = SOLAR_MSG_CMD
   uint8_t  planet_index;  // 0..7, informational (Sun maps index->MAC)
   uint8_t  command;       // PlanetCmd
-  float    wheel_l_rpm;   // left wheel (outer track); sign = direction
-  float    wheel_r_rpm;   // right wheel (inner track); sign = direction
+  float    wheel_l_rpm;   // left wheel (outer track, faster); sign = direction
+  float    wheel_r_rpm;   // right wheel (inner track, slower); sign = direction
   uint8_t  light_on;      // 0/1
   uint16_t current_ma;    // TMC rms current to apply to all drivers
-  uint16_t microsteps;    // TMC microsteps (valid power of 2: 1,2,4,...,256 — 256 needs 16 bits)
+  uint8_t  driver_cfg;    // packed TMC params: see SOLAR_DRVCFG_* / solarPackDriverCfg()
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
-  uint8_t  chopper_mode;  // 0 = stealthChop (quiet), 1 = spreadCycle (more torque/noise)
-  uint8_t  interpolate;   // MicroPlyer: 1 = interpolate microsteps up to 256 internally
   uint16_t stall_threshold; // StallGuard load below this while driving = stuck (0 = disabled)
 };
 

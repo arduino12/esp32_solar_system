@@ -69,7 +69,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
     },
     "rail": {
       "width_mm": 70,
-      "inner_diameter_mm": [500,600,700,800,900,1000,1100,1200],
+      "outer_diameter_mm": [640,740,840,940,1040,1140,1240,1340],
       "log_scale_speed_rpm": [300,270,200,120,104,62,38,22]
     }
   },
@@ -182,12 +182,28 @@ static void saveSettings() {
 // Drop keys belonging to removed features so an old saved file doesn't keep resurfacing them in
 // the web form. Runs once at boot and rewrites the file only if something changed.
 static void migrateSettings() {
+  bool changed = false;
   JsonObject planets = g_settings["planets"].as<JsonObject>();
   if (!planets.isNull() && !planets["axial_rotation_speed_rpm"].isNull()) {
     planets.remove("axial_rotation_speed_rpm");
-    saveSettings();
+    changed = true;
     Serial.println("Migrated settings: removed obsolete axial_rotation_speed_rpm");
   }
+  // inner_diameter_mm -> outer_diameter_mm: the model now takes the OUTER rail diameter, which is
+  // larger than the old inner value by 2*width_mm. Convert in place so an old file keeps its rig.
+  JsonObject rail = g_settings["planets"]["rail"].as<JsonObject>();
+  if (!rail.isNull() && !rail["inner_diameter_mm"].isNull() && rail["outer_diameter_mm"].isNull()) {
+    float w = rail["width_mm"] | 70.0f;
+    float vals[SOLAR_PLANET_COUNT]; int n = 0;    // copy out first (adding a key may move the pool)
+    for (JsonVariant v : rail["inner_diameter_mm"].as<JsonArray>())
+      if (n < SOLAR_PLANET_COUNT) vals[n++] = v.as<float>() + 2.0f * w;
+    rail.remove("inner_diameter_mm");
+    JsonArray out = rail["outer_diameter_mm"].to<JsonArray>();
+    for (int k = 0; k < n; k++) out.add(vals[k]);
+    changed = true;
+    Serial.println("Migrated settings: inner_diameter_mm -> outer_diameter_mm (+2*width)");
+  }
+  if (changed) saveSettings();
 }
 
 static void saveStats();   // fwd
@@ -285,25 +301,36 @@ static void sendCmd(int i, const CmdMsg &m) {
 }
 
 // ----------------------------- Speed model -----------------------------------
-// Given the per-rail reference wheel speed, compute the two wheel speeds so the cart rolls
-// around the ring (outer track faster than inner by the radius ratio), and the resulting
-// orbital speed for the web animation. See plan "Per-planet speed computation".
+// Pack the three per-move TMC params (microsteps / chopper / MicroPlyer) into the one byte the
+// planet decodes with solarMicrostepsFromEnum()/SOLAR_DRVCFG_*.
+static uint8_t packDriverCfg(JsonObject pl) {
+  uint16_t ms   = pl["wheels"]["stepper"]["microsteps"] | 16;
+  bool spread   = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread");
+  bool interp   = (pl["wheels"]["stepper"]["microplyer"] | true);
+  return solarPackDriverCfg(ms, spread, interp);
+}
+
+// Given the per-rail OUTER wheel speed, compute the two wheel speeds so the cart rolls around the
+// ring, and the resulting orbital speed for the web animation. log_scale_speed_rpm is the OUTER
+// (faster) wheel; the inner rail is smaller by 2*width_mm, so the inner wheel turns proportionally
+// slower (ratio = Rin/Rout <= 1). L = outer, R = inner (matches the CmdMsg field comments).
 static CmdMsg buildRunCmd(int i, bool light) {
   JsonObject pl   = g_settings["planets"];
   float dWheel    = pl["wheels"]["diameter_mm"] | 36.0f;
   float railW     = pl["rail"]["width_mm"]      | 70.0f;
-  float innerD    = pl["rail"]["inner_diameter_mm"][i] | 500.0f;
+  float outerD    = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
   float base      = pl["rail"]["log_scale_speed_rpm"][i] | 100.0f;
   float maxRpm    = pl["wheels"]["stepper"]["max_speed_rpm"][i] | 500.0f;
 
-  float Rin  = innerD * 0.5f;
-  float Rout = Rin + railW;
-  float wheelR = base;                    // inner track = reference
-  float wheelL = base * (Rout / Rin);     // outer track proportionally faster
+  float Rout = outerD * 0.5f;
+  float Rin  = Rout - railW;
+  if (Rin < 1.0f) Rin = 1.0f;             // guard degenerate geometry (outerD <= 2*width)
+  float wheelL = base;                    // outer track = reference (the higher speed)
+  float wheelR = base * (Rin / Rout);     // inner track proportionally slower
   if (wheelL > maxRpm) { float k = maxRpm / wheelL; wheelL *= k; wheelR *= k; }
 
   float sign = (i % 2 == 0) ? 1.0f : -1.0f;   // alternate direction for visual variety
-  float orbital = (Rin > 0.1f) ? (wheelR * dWheel / (2.0f * Rin)) : 0.0f;
+  float orbital = (Rout > 0.1f) ? (wheelL * dWheel / (2.0f * Rout)) : 0.0f;
   g_planet[i].orbitalRpm = orbital * sign;
 
   CmdMsg m = {};
@@ -313,10 +340,8 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
-  m.microsteps  = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
-  m.chopper_mode = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread") ? 1 : 0;
-  m.interpolate  = (pl["wheels"]["stepper"]["microplyer"] | true) ? 1 : 0;
+  m.driver_cfg  = packDriverCfg(pl);
   m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
   return m;
 }
@@ -328,19 +353,16 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
-  m.microsteps = pl["wheels"]["stepper"]["microsteps"] | 16;
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
-  m.chopper_mode = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread") ? 1 : 0;
-  m.interpolate  = (pl["wheels"]["stepper"]["microplyer"] | true) ? 1 : 0;
+  m.driver_cfg  = packDriverCfg(pl);
   m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"] | 0;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
-    float dWheel = pl["wheels"]["diameter_mm"] | 36.0f;
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
-    float innerD = pl["rail"]["inner_diameter_mm"][i] | 500.0f;
-    float Rin = innerD * 0.5f, Rout = Rin + railW;
-    m.wheel_r_rpm = HOMING_BASE_RPM;
-    m.wheel_l_rpm = HOMING_BASE_RPM * (Rout / Rin);
-    (void)dWheel;
+    float outerD = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
+    float Rout = outerD * 0.5f, Rin = Rout - railW;
+    if (Rin < 1.0f) Rin = 1.0f;
+    m.wheel_l_rpm = HOMING_BASE_RPM;                 // outer wheel (faster)
+    m.wheel_r_rpm = HOMING_BASE_RPM * (Rin / Rout);  // inner wheel (slower)
     g_planet[i].orbitalRpm = 0;
   } else {
     g_planet[i].orbitalRpm = 0;

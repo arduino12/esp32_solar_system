@@ -207,7 +207,7 @@ function mkInput(v,path){
  return inp;
 }
 const MICROSTEPS=[1,2,4,8,16,32,64,128,256];
-const CHOPPER=['stealth','spread'];
+const CHOPPER=[['stealth','stealth (quiet)'],['spread','spread (normal)']];  // [value,label]
 function mkSelect(v,path,opts){                 // restrict a value to a fixed numeric option set
  const sel=document.createElement('select');
  opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
@@ -215,10 +215,11 @@ function mkSelect(v,path,opts){                 // restrict a value to a fixed n
  sel.onchange=()=>setPath(cfg,path,parseInt(sel.value));
  return sel;
 }
-function mkSelectStr(v,path,opts){              // restrict a value to a fixed string option set
- const sel=document.createElement('select');
- opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
-  if(o===v)op.selected=true;sel.appendChild(op)});
+function mkSelectStr(v,path,opts){              // restrict a value to a fixed string option set;
+ const sel=document.createElement('select');   // opts entries may be 'value' or ['value','label']
+ opts.forEach(o=>{const val=Array.isArray(o)?o[0]:o,txt=Array.isArray(o)?o[1]:o;
+  const op=document.createElement('option');op.value=val;op.textContent=txt;
+  if(val===v)op.selected=true;sel.appendChild(op)});
  sel.onchange=()=>setPath(cfg,path,sel.value);
  return sel;
 }

@@ -70,6 +70,13 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 // the serial heartbeat / the Sun UI and set the threshold a little above the "held" reading but
 // below the free-running reading. 0 disables the check.
 #define FAULT_DEBOUNCE     3               // consecutive bad polls before a fault is latched
+// Stall detection uses a RUNNING AVERAGE of the StallGuard load per wheel, because a single
+// SG_RESULT sample is noisy and reads low at low RPM (unreliable for a bare threshold). The EMA
+// is (re)armed at SG_AVG_INIT_MULT * threshold, so only several consecutive low readings pull it
+// under the threshold -> a stall is declared (this also spaces out the auto-retry attempts).
+#define SG_AVG_ALPHA       0.30f           // EMA weight per fault poll (higher = reacts faster)
+#define SG_AVG_INIT_MULT   5               // arm the average at this * stall_threshold
+#define STALL_RESTART_MS   800             // pause after the hard stop before spinning up again
 
 // ----------------------------- Radio / power --------------------------------
 // The C3 runs warm because its Wi-Fi radio is always on for ESP-NOW. Two levers reduce it:
@@ -128,6 +135,8 @@ static bool     g_pendingInterp  = true;
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
 static uint16_t g_sgL = 0, g_sgR = 0;      // last StallGuard load readings (for tuning)
+static float    g_sgAvgL = 0, g_sgAvgR = 0;// running (EMA) StallGuard load per wheel
+static uint32_t g_stallRecoverMs = 0;      // when !=0: millis() at which to spin up again after a stall
 static uint8_t  g_drvStat = 0;             // last open-load/overtemp flag snapshot (bitfield)
 
 static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
@@ -182,17 +191,6 @@ static float readDieTempC() {
 static float rpmToUstepsHz(float rpm) {
   float fullStepsPerRev = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
   return (rpm / 60.0f) * fullStepsPerRev * (float)g_microsteps;
-}
-
-// Round an arbitrary microstep request to the nearest valid TMC2209 value (power of two, 1..256).
-static uint16_t sanitizeMicrosteps(uint16_t m) {
-  const uint16_t valid[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
-  uint16_t best = 16, bestErr = 0xFFFF;
-  for (uint16_t v : valid) {
-    uint16_t e = (v > m) ? (v - m) : (m - v);
-    if (e < bestErr) { bestErr = e; best = v; }
-  }
-  return best;
 }
 
 // Write microsteps and VERIFY over UART. The TMCStepper library encodes full-step (1) as register
@@ -278,6 +276,13 @@ static void tmcBringup() {
   applyDriverParams();
 }
 
+// (Re)arm the running StallGuard average to its high init value (SG_AVG_INIT_MULT * threshold), so
+// a fresh spin-up must gather several low readings before the average trips a stall.
+static inline void resetSgAvg() {
+  float init = (float)g_stallThreshold * SG_AVG_INIT_MULT;
+  g_sgAvgL = g_sgAvgR = init;
+}
+
 // Enable/disable the drivers. Levers, strongest first:
 //   1. PIN_MOTOR_PWR cuts the motor supply (VM) entirely when idle — true sleep, ~zero draw.
 //      VCC_IO stays on 3.3V so the TMC register config survives and needs no re-init on wake.
@@ -288,6 +293,7 @@ static void motorsEnable(bool on) {
     delayMicroseconds(1500);                    // let VM settle before driving
     drvL.toff(4); drvR.toff(4);                 // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
+    resetSgAvg();                               // start the stall average high (needs low run to trip)
   } else {
     ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);   // STEP lines low: stop the step trains
     g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
@@ -408,10 +414,12 @@ static void serviceCommand() {
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
   g_stallThreshold = m.stall_threshold;     // stuck-detection threshold (0 = disabled)
+  g_stallRecoverMs = 0;                      // a fresh command supersedes any pending auto-retry
 
-  uint16_t effUs = sanitizeMicrosteps(m.microsteps);
-  bool spread = (m.chopper_mode != 0);
-  bool interp = (m.interpolate != 0);
+  // Unpack the driver-config byte (microsteps enum + chopper + MicroPlyer bits).
+  uint16_t effUs = solarMicrostepsFromEnum(m.driver_cfg & 0x0F);
+  bool spread = (m.driver_cfg & SOLAR_DRVCFG_CHOP)   != 0;
+  bool interp = (m.driver_cfg & SOLAR_DRVCFG_INTERP) != 0;
   bool microChanged   = (effUs != g_microsteps);
   bool currentChanged = (m.current_ma != g_currentMa);
   bool chopChanged    = (spread != g_spread) || (interp != g_interpolate);
@@ -535,19 +543,38 @@ static void serviceStatusLed() {
   digitalWrite(PIN_STATUS_LED, on ? LOW : HIGH);        // active-low
 }
 
+// A wheel is mechanically held. Stop the cart INSTANTLY (no decel ramp): kill both step trains and
+// disable the drivers, report the fault right away, then schedule a fresh spin-up (as if a new RUN
+// arrived) as long as the Sun still wants us moving. The status is pushed immediately so the Sun
+// registers the stall even though the fault clears again the moment the drivers go idle.
+static void handleStall() {
+  Serial.printf("STALL detected (sgAvg L=%.0f R=%.0f thr=%u): hard stop + retry\n",
+                g_sgAvgL, g_sgAvgR, g_stallThreshold);
+  g_error = ERR_MOTOR_STUCK;
+  ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);    // instant: STEP lines low, no deceleration
+  g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
+  g_velFinalL = g_velFinalR = 0; g_actHzL = g_actHzR = 0; g_rampFrac = 1.0f;
+  g_resumePending = false; g_stopThenOff = false;
+  sendStatus();                                        // make sure the Sun sees ERR_MOTOR_STUCK
+  motorsEnable(false);                                 // disable outputs + cut VM
+  bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
+  g_stallRecoverMs = wantMotion ? (millis() + STALL_RESTART_MS) : 0;
+}
+
 // ----------------------------- Fault polling --------------------------------
 // TMC2209 fault sensing is inherently limited: test_connection() only proves the *driver chip*
 // answers over UART (it stays "OK" if you unplug just the motor coils), and open-load /
 // StallGuard flags are only meaningful while the coils are actually being driven. So we sample
 // them only when the motor is enabled and moving, and require several consecutive bad polls
-// (FAULT_DEBOUNCE) before latching a fault, to avoid the flags' well-known false positives.
+// (FAULT_DEBOUNCE) before latching a disconnect. Stall uses a running SG average (see below).
 static void serviceFaults() {
   if (millis() - g_lastFaultMs < 500) return;
   g_lastFaultMs = millis();
 
-  static uint8_t discCnt = 0, stuckCnt = 0;
+  static uint8_t discCnt = 0;
   if (!g_motorsOn) {                     // drivers asleep (VM may be cut): nothing valid to read
-    g_error = ERR_NONE; g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = stuckCnt = 0;
+    if (g_error != ERR_MOTOR_STUCK) g_error = ERR_NONE;  // keep a just-set stall until recovery
+    g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = 0;
     return;
   }
   bool driving = g_motorsOn && wheelsMoving();
@@ -563,17 +590,36 @@ static void serviceFaults() {
   bool openLoad = driving && (g_drvStat & 0x0F);       // a coil open while being driven
   bool disc     = commsBad || openLoad;
 
-  // Stuck: commanded to move but StallGuard load collapses (rotor physically held). The threshold
-  // comes from the Sun (g_stallThreshold); 0 disables it until tuned against the real rig.
-  bool stuck = (g_stallThreshold > 0) && driving && !disc &&
-               ((g_sgL < g_stallThreshold) || (g_sgR < g_stallThreshold));
+  // Running StallGuard average per wheel. SG_RESULT is noisy and reads low at low RPM, so we only
+  // fold samples into the EMA once the wheel is AT its commanded speed (ramp settled); during the
+  // accel ramp the average stays parked at its high init value (no false trips while speeding up).
+  bool atSpeed = driving && (g_rampFrac >= 1.0f);
+  bool lMoving = fabsf(g_velCurL) > 1.0f;
+  bool rMoving = fabsf(g_velCurR) > 1.0f;
+  if (atSpeed && lMoving) g_sgAvgL += SG_AVG_ALPHA * ((float)g_sgL - g_sgAvgL);
+  if (atSpeed && rMoving) g_sgAvgR += SG_AVG_ALPHA * ((float)g_sgR - g_sgAvgR);
 
-  discCnt  = disc  ? (uint8_t)(discCnt  + 1) : 0;
-  stuckCnt = stuck ? (uint8_t)(stuckCnt + 1) : 0;
+  bool stuck = (g_stallThreshold > 0) && atSpeed && !disc &&
+               ((lMoving && g_sgAvgL < (float)g_stallThreshold) ||
+                (rMoving && g_sgAvgR < (float)g_stallThreshold));
 
-  if      (discCnt  >= FAULT_DEBOUNCE) g_error = ERR_MOTOR_DISCONNECTED;
-  else if (stuckCnt >= FAULT_DEBOUNCE) g_error = ERR_MOTOR_STUCK;
-  else if (!disc && !stuck)            g_error = ERR_NONE;
+  discCnt = disc ? (uint8_t)(discCnt + 1) : 0;
+  if (discCnt >= FAULT_DEBOUNCE) { g_error = ERR_MOTOR_DISCONNECTED; return; }
+  if (stuck)                     { handleStall(); return; }
+  g_error = ERR_NONE;                                  // healthy (or still accelerating)
+}
+
+// Finish a stall recovery: after the brief post-stop pause, re-enable and ramp back up to the last
+// commanded speed — but only while the Sun still wants motion and the cart is still online. (A
+// fresh command that arrives during the pause clears g_stallRecoverMs and restarts us itself.)
+static void serviceStallRecover() {
+  if (!g_stallRecoverMs || (int32_t)(millis() - g_stallRecoverMs) < 0) return;
+  g_stallRecoverMs = 0;
+  bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
+  if (!wantMotion || g_state == ST_OFFLINE) return;
+  Serial.printf("stall recovery: re-accelerating to L=%.2f R=%.2f rpm\n", g_cmdWheelL, g_cmdWheelR);
+  motorsEnable(true);
+  wheelSetTargets(g_cmdWheelL, g_cmdWheelR);
 }
 
 // ----------------------------- Homing ---------------------------------------
@@ -668,6 +714,7 @@ void loop() {
   serviceHoming();
   serviceRamp();
   serviceFaults();
+  serviceStallRecover();
 
   // Periodic status transmit, jittered 1-3s to avoid collisions among the 8 carts.
   if (now >= g_nextStatusMs) {
@@ -694,16 +741,16 @@ void loop() {
     float fullSteps = 360.0f / (g_stepDegree > 0.01f ? g_stepDegree : 1.8f);
     float rpmL = g_actHzL / (fullSteps * g_microsteps) * 60.0f * (g_velCurL < 0 ? -1 : 1);
     float rpmR = g_actHzR / (fullSteps * g_microsteps) * 60.0f * (g_velCurR < 0 ? -1 : 1);
-    Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%s | "
-                  "TMC:%s I=%umA usteps=%u %s mplyer=%d %.1fdeg sg=%u/%u ol=0x%02X | "
-                  "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz f=%.2f) | "
+    Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%d | "
+                  "TMC:%s I=%umA usteps=%u %s%s sg=%u/%u ol=0x%02X | "
+                  "cmd L=%.2f R=%.2f rpm -> now L=%.2f R=%.2f rpm (%.0f/%.0f Hz) | "
                   "light=%d motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
-                  rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? "ON" : "off",
+                  rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? 1 : 0,
                   errText(g_error), g_currentMa, g_microsteps,
-                  g_spread ? "spread" : "stealth", g_interpolate, g_stepDegree,
+                  g_spread ? "spread" : "stealth", g_interpolate ? " mplyer" : "",
                   g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
-                  rpmL, rpmR, g_actHzL, g_actHzR, g_rampFrac,
+                  rpmL, rpmR, g_actHzL, g_actHzR,
                   g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
   }
 }
