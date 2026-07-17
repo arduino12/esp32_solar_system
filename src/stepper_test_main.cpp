@@ -51,6 +51,21 @@ static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
 #define TMC_ADDR_R    0b10
 #define RAMP_UPDATE_MS 20          // how often the software frequency ramp advances
 
+// ---- Fault detection / recovery ----------------------------------------------
+// Open-load (disconnected motor / broken coil) is only reliably flagged by the TMC2209 in
+// SPREADCYCLE, and there it works down to ~1 rpm; in StealthChop the flags are dead below ~50 rpm
+// (measured on the rig). So regardless of the chosen chopper mode we run a brief PERIODIC
+// SPREADCYCLE PROBE: switch the driven coils to spreadCycle for one poll, read OLA/OLB, then
+// restore the configured mode. A disconnected coil sets BOTH OLA and OLB every probe; a connected
+// coil never sets both at once (occasional single-flag transients are rejected by requiring both
+// + a short debounce). Stall uses a running SG average (armed high, only low readings pull it down).
+#define FAULT_POLL_MS     250      // fault service cadence; also the spreadCycle probe settle time
+#define PROBE_INTERVAL_MS 2000     // start an open-load probe this often while moving (~11% spread duty)
+#define OPEN_DEBOUNCE     2        // consecutive probes with both OLA+OLB before latching open-load
+#define SG_AVG_ALPHA      0.30f    // EMA weight for the running StallGuard average
+#define SG_AVG_INIT_MULT  5        // arm the SG average at this * stall_threshold
+#define FAULT_RESTART_MS  800      // pause after a hard stop before re-applying params + retrying
+
 HardwareSerial TMC_SERIAL(1);
 TMC2209Stepper drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
 TMC2209Stepper drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
@@ -87,6 +102,17 @@ struct WriteCheck {
   bool     checked      = false;
 };
 static WriteCheck g_wc[2];
+
+// Fault detection + recovery state (per motor: [0]=L, [1]=R).
+static uint16_t g_stallThresh   = 0;            // SG below this (running avg) while moving = stuck; 0=off
+static bool     g_openLoad[2]   = {false, false};
+static bool     g_stuck[2]      = {false, false};
+static float    g_sgAvg[2]      = {0, 0};        // running StallGuard average
+static uint16_t g_sgNow[2]      = {0, 0};        // last raw SG_RESULT
+static uint8_t  g_pwmSum[2]     = {0, 0};        // last PWM_SCALE_SUM
+static int16_t  g_pwmAuto[2]    = {0, 0};        // last PWM_SCALE_AUTO
+static uint16_t g_irms[2]       = {0, 0};        // delivered current estimate (0 when open)
+static uint8_t  g_faults[2]     = {0, 0};        // recovery attempt counter (for the UI)
 
 // Deferred web actions handled in loop() (keep all UART/LEDC access on the main task).
 static volatile bool g_doApply[2]  = {false, false};
@@ -222,6 +248,94 @@ static void serviceRamp() {
   }
 }
 
+// ----------------------------- Fault detection + recovery --------------------
+// Periodic spreadCycle open-load probe + running-average stall detection, with a hard-stop /
+// re-apply-params / retry recovery. Called every loop(); does its work every FAULT_POLL_MS.
+static uint32_t g_faultPollMs  = 0;
+static uint32_t g_probeStartMs = 0;
+static bool     g_probing      = false;
+static uint8_t  g_openCnt[2]   = {0, 0};
+static uint32_t g_recoverMs[2] = {0, 0};
+
+static inline bool motorMoving(int i) { return g_enabled && g_actHz[i] > 1.0f; }
+
+static void serviceFaults() {
+  uint32_t now = millis();
+
+  // Pending recoveries: after the pause, RE-APPLY the driver params (a disconnect can make the
+  // driver forget its config) and then resume motion if still commanded to run.
+  for (int i = 0; i < 2; i++) {
+    if (g_recoverMs[i] && (int32_t)(now - g_recoverMs[i]) >= 0) {
+      g_recoverMs[i] = 0;
+      if (g_enabled && g_cfg[i].run) {
+        Serial.printf("M%d recovery: RE-APPLY params + resume\n", i);
+        applyDriver(i);            // re-flash microsteps/current/mode/etc to the driver
+        driveMotor(i);             // ramp back toward target
+      }
+    }
+  }
+
+  if (now - g_faultPollMs < FAULT_POLL_MS) return;
+  g_faultPollMs = now;
+
+  // Clear fault state for any motor not currently commanded to run (so a stopped motor doesn't
+  // show a stale fault). Motors mid-recovery keep run=true, so their flags persist.
+  for (int i = 0; i < 2; i++)
+    if (!(g_enabled && g_cfg[i].run)) { g_openLoad[i] = g_stuck[i] = false; g_openCnt[i] = 0; }
+
+  bool afterProbe = false;
+  if (g_probing) {
+    // Probe settled (one FAULT_POLL_MS in spreadCycle): read OLA/OLB, then restore configured mode.
+    for (int i = 0; i < 2; i++) {
+      TMC2209Stepper &d = drv(i);
+      bool openRaw = motorMoving(i) && d.ola() && d.olb();
+      g_openCnt[i]  = openRaw ? (uint8_t)min(255, g_openCnt[i] + 1) : 0;
+      g_openLoad[i] = g_openCnt[i] >= OPEN_DEBOUNCE;
+      d.en_spreadCycle(g_cfg[i].spread);       // restore the user's chopper mode
+    }
+    g_probing = false;
+    afterProbe = true;
+  } else if ((motorMoving(0) || motorMoving(1)) && now - g_probeStartMs >= PROBE_INTERVAL_MS) {
+    // Start a probe: force the moving coils into spreadCycle (OLA/OLB only reliable there).
+    for (int i = 0; i < 2; i++) if (motorMoving(i)) drv(i).en_spreadCycle(true);
+    g_probeStartMs = now;
+    g_probing = true;
+    return;                                     // let it settle until the next poll
+  }
+
+  // Stall (running SG average) + current snapshot, read in the configured mode. The average is ARMED
+  // HIGH (SG_AVG_INIT_MULT * threshold) at the instant motion starts, so a stall needs several
+  // consecutive low readings to pull it under the threshold (no instant false trip on spin-up). Skip
+  // the SG fold on the tick right after a probe (mode just switched back -> transient reading).
+  static bool wasMoving[2] = {false, false};
+  for (int i = 0; i < 2; i++) {
+    TMC2209Stepper &d = drv(i);
+    bool moving = motorMoving(i);
+    g_sgNow[i]   = d.SG_RESULT();
+    g_pwmSum[i]  = d.pwm_scale_sum();
+    g_pwmAuto[i] = d.pwm_scale_auto();
+    uint16_t est = d.cs2rms(d.cs_actual());           // scale->mA; clamp to setpoint (rails high on
+    if (est > g_cfg[i].currentMa) est = g_cfg[i].currentMa;   // an open coil in stealth between probes)
+    g_irms[i]    = g_openLoad[i] ? 0 : est;           // open coil carries ~0 mA
+    if (!moving || (moving && !wasMoving[i]))
+      g_sgAvg[i] = (float)g_stallThresh * SG_AVG_INIT_MULT;    // arm high at standstill / on motion start
+    else if (!g_openLoad[i] && !afterProbe)
+      g_sgAvg[i] += SG_AVG_ALPHA * ((float)g_sgNow[i] - g_sgAvg[i]);
+    g_stuck[i] = (g_stallThresh > 0) && moving && !g_openLoad[i] && (g_sgAvg[i] < (float)g_stallThresh);
+    wasMoving[i] = moving;
+  }
+
+  // A fault on a running motor: hard-stop that coil now, schedule re-apply+retry after a pause.
+  for (int i = 0; i < 2; i++) {
+    if (g_enabled && g_cfg[i].run && (g_openLoad[i] || g_stuck[i]) && !g_recoverMs[i]) {
+      Serial.printf("M%d FAULT: %s -> hard stop + recover\n", i, g_openLoad[i] ? "OPEN_LOAD" : "STUCK");
+      ledcStop(i); g_curHz[i] = g_tgtHz[i] = 0;
+      g_faults[i]++;
+      g_recoverMs[i] = now + FAULT_RESTART_MS;
+    }
+  }
+}
+
 // ----------------------------- Status JSON -----------------------------------
 static void buildStatus(String &out) {
   JsonDocument d;
@@ -263,23 +377,19 @@ static void buildStatus(String &out) {
     t["usteps_rb"] = usRb;                               // microsteps read back (0 -> 1)
     bool shaftRb = dd.shaft();
     t["dir_rb"]  = shaftRb ? "CCW" : "CW";               // direction read back from GCONF
-    uint16_t cs  = dd.cs_actual();
-    t["cs_actual"] = cs;
-    // Open-load / disconnected coil. cs_actual is only the SETPOINT scale (identical whether or not
-    // a coil is connected), so it can't tell us if current actually flows. Instead watch the
-    // StealthChop PWM autoscaler: with an open winding it can't reach the target current, so
-    // PWM_SCALE_SUM pins at its 255 ceiling AND PWM_SCALE_AUTO rails high. In SpreadCycle use OLA/OLB.
-    uint8_t ps  = dd.pwm_scale_sum();
-    int16_t pa  = dd.pwm_scale_auto();
-    bool moving = g_actHz[i] > 1.0f;
-    bool openLoad = moving && (c.spread ? (dd.ola() || dd.olb())
-                                        : (ps >= 250 && pa >= 100));
-    t["pwm_sum"]  = ps;
-    t["pwm_auto"] = pa;
-    t["open"]     = openLoad;
+    t["cs_actual"] = dd.cs_actual();
+    // Fault state — computed in serviceFaults() (open-load from the periodic spreadCycle probe,
+    // stall from the running SG average). Do NOT re-derive open-load from a live read here: OLA/OLB
+    // are only valid during the probe, and PWM_SCALE is dead at low RPM.
+    t["open"]     = g_openLoad[i];
+    t["stuck"]    = g_stuck[i];
+    t["pwm_sum"]  = g_pwmSum[i];
+    t["pwm_auto"] = g_pwmAuto[i];
     // Delivered current: an open coil carries ~0 mA regardless of the commanded scale.
-    t["irms_rb"] = openLoad ? 0 : dd.cs2rms(cs);
-    t["sg"]      = dd.SG_RESULT();
+    t["irms_rb"]  = g_irms[i];
+    t["sg"]       = g_sgNow[i];
+    t["sg_avg"]   = (int)(g_sgAvg[i] + 0.5f);
+    t["faults"]   = g_faults[i];
     t["stst"]    = dd.stst();
     t["stealth"] = dd.stealth();
     t["intpol"]  = dd.intpol();          // MicroPlyer state read back from CHOPCONF
@@ -342,6 +452,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
    <label>Decel (rpm/s)</label><input id=decel type=number value=300>
    <label>Chopper</label><select id=mode><option value=stealth selected>stealthChop (quiet)</option><option value=spread>spreadCycle (normal)</option></select>
    <label>MicroPlyer</label><select id=microplyer><option value=1 selected>on (interp. to 256)</option><option value=0>off</option></select>
+   <label>Stall thr</label><input id=stall_threshold type=number value=0 title="running SG average below this while moving = stuck; 0 = stall detection off">
  </div>
 </div>
 
@@ -372,7 +483,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 const $=id=>document.getElementById(id);
 function cfg(){return{microsteps:+$('microsteps').value,current_ma:+$('current_ma').value,
   hold_pct:+$('hold_pct').value,step_degree:+$('step_degree').value,accel:+$('accel').value,
-  decel:+$('decel').value,mode:$('mode').value,microplyer:$('microplyer').value=='1'};}
+  decel:+$('decel').value,mode:$('mode').value,microplyer:$('microplyer').value=='1',
+  stall_threshold:+$('stall_threshold').value};}
 function motor(m){return{speed:+$(m+'speed').value,dir:$(m+'dir').value};}
 function post(p,o){return fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}
 function en(on){post('/api/enable',{on:!!on});}
@@ -391,10 +503,10 @@ function fill(el,m,t){
   h+=row('version','0x'+t.version.toString(16)+(t.version==0x21?' <span class=ok>(TMC2209)</span>':' <span class=bad>?</span>'));
   h+=row('microsteps (set/read)',chk(m.cfg.microsteps,t.usteps_rb));
   h+=row('direction (set/read)',chk(m.cfg.dir,t.dir_rb));
-  h+=row('current set / delivered',m.cfg.current_ma+' mA (hold '+m.cfg.hold_pct+'%) / <b>'+t.irms_rb+' mA</b>'+(t.open?' <span class=bad>(open load!)</span>':''));
-  h+=row('coil',t.open?'<span class=bad>OPEN LOAD / DISCONNECTED</span>':'<span class=ok>connected</span>')+
-     '<tr><td>PWM scale sum/auto</td><td><span style="color:#888">'+t.pwm_sum+' / '+t.pwm_auto+'</span></td></tr>';
-  h+=row('StallGuard',t.sg+(m.running&&t.sg==0?' <span class=bad>(stuck?)</span>':''));
+  h+=row('current set / delivered',m.cfg.current_ma+' mA (hold '+m.cfg.hold_pct+'%) / <b class="'+(t.open?'bad':'ok')+'">'+t.irms_rb+' mA</b>');
+  h+=row('coil',t.open?'<span class=bad>OPEN LOAD / DISCONNECTED</span>':'<span class=ok>connected</span>');
+  h+=row('StallGuard now / avg',t.sg+' / <b>'+t.sg_avg+'</b>'+(t.stuck?' <span class=bad>STUCK</span>':''));
+  h+=row('recoveries',t.faults);
   h+=row('standstill',b(t.stst));
   h+=row('mode',t.stealth?'stealthChop':'spreadCycle');
   h+=row('MicroPlyer (set/read)',chk(m.cfg.microplyer?'on':'off',t.intpol?'on':'off'));
@@ -432,6 +544,7 @@ static void ingest(JsonVariant &j) {
       g_cfg[i].spread     = String((const char*)(c["mode"] | "stealth")) == "spread";
       if (!c["microplyer"].isNull()) g_cfg[i].interpolate = c["microplyer"].as<bool>();
     }
+    g_stallThresh = c["stall_threshold"] | g_stallThresh;   // shared; 0 disables stall detection
   }
   JsonObject L = j["L"], R = j["R"];
   if (!L.isNull()) { g_cfg[0].speedRpm = L["speed"] | g_cfg[0].speedRpm;
@@ -513,6 +626,7 @@ void loop() {
     if (g_doApply[i]) { g_doApply[i] = false; applyDriver(i); driveMotor(i); }
   }
   serviceRamp();
+  serviceFaults();
 
   if (WiFi.status() != WL_CONNECTED) {
     static uint32_t lastTry = 0;
