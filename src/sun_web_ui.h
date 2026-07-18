@@ -77,7 +77,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="mode" id="mode">--</div>
 <div class="timer" id="timer">00:00:00</div>
 <svg viewBox="0 0 400 400" id="sky"></svg>
-<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>Load</th><th>Fault</th></tr></thead>
+<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>Fault</th></tr></thead>
 <tbody id="ptab"></tbody></table>
 <div id="log"></div>
 </div>
@@ -187,9 +187,8 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   const temp=tc==null?'—':('<span class="'+(tc>=70?'hot':'')+'">'+tc+'&deg;C</span>');
   const fault=pl.error?('<span class="er">'+(ERRTXT[pl.error]||('err '+pl.error))+'</span>'):(pl.online?'ok':'—');
   const cfg=!pl.online?'—':(pl.cfg_ok?'ok':'<span class="er">CHECK</span>');
-  const load=pl.online?(pl.sg_load):'—';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
-   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+load+'</td><td>'+fault+'</td></tr>';
+   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fault+'</td></tr>';
  });
  $('#ptab').innerHTML=rows;
  $('#log').textContent=(d.log||[]).join('\n');
@@ -240,6 +239,16 @@ function render(key,val,path){
   val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
    const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
    f.appendChild(l);f.appendChild(mkInput(el,path.concat(i)));fs.appendChild(f);});
+  return fs;
+ }
+ if(key==='colors'&&Array.isArray(val)){        // per-planet WS2812 light colour picker
+  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
+  lg.textContent='light colors';fs.appendChild(lg);
+  val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
+   const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
+   const inp=document.createElement('input');inp.type='color';inp.value=el;
+   inp.onchange=()=>setPath(cfg,path.concat(i),inp.value);
+   f.appendChild(l);f.appendChild(inp);fs.appendChild(f);});
   return fs;
  }
  if(Array.isArray(val)){

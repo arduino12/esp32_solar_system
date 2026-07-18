@@ -32,11 +32,13 @@ enum PlanetCmd : uint8_t {
   CMD_LIGHT,           // set only the light state (no motion change)
 };
 
-// Fault codes reported by a planet.
+// Fault codes reported by a planet. (Motor stuck/disconnected sensing was dropped — the TMC2209
+// flags aren't reliable in the quiet/low-speed operating regime — so a planet currently only ever
+// reports ERR_NONE. The codes are kept for wire compatibility / future use.)
 enum PlanetErr : uint8_t {
   ERR_NONE = 0,
-  ERR_MOTOR_DISCONNECTED,   // a TMC driver failed test_connection()
-  ERR_MOTOR_STUCK,          // commanded to move but no motion / stall detected
+  ERR_MOTOR_DISCONNECTED,
+  ERR_MOTOR_STUCK,
 };
 
 // ------------------------ Packed driver-config byte -------------------------
@@ -70,10 +72,12 @@ struct __attribute__((packed)) CmdMsg {
   float    wheel_l_rpm;   // left wheel (outer track, faster); sign = direction
   float    wheel_r_rpm;   // right wheel (inner track, slower); sign = direction
   uint8_t  light_on;      // 0/1
+  uint8_t  light_r;       // WS2812 colour to show when light_on (per-planet, set on the Sun)
+  uint8_t  light_g;
+  uint8_t  light_b;
   uint16_t current_ma;    // TMC rms current to apply to all drivers
   uint8_t  driver_cfg;    // packed TMC params: see SOLAR_DRVCFG_* / solarPackDriverCfg()
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
-  uint16_t stall_threshold; // StallGuard load below this while driving = stuck (0 = disabled)
 };
 
 // Planet -> Sun. Broadcast until the Sun's MAC is learned, then unicast to it.
@@ -88,7 +92,6 @@ struct __attribute__((packed)) StatusMsg {
   int8_t   temp_c;        // ESP32-C3 internal die temperature, °C (INT8_MIN = unknown)
   int8_t   rssi;          // last measured Sun-AP signal, dBm (0 = unknown)
   uint8_t  cfg_ok;        // 1 = last driver-param apply verified over UART (read-back + IFCNT)
-  uint16_t sg_load;       // last StallGuard load reading (min of both wheels; for tuning)
 };
 
 #define PLANET_INDEX_UNKNOWN 0xFF

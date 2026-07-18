@@ -33,6 +33,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <TMCStepper.h>
+#define FASTLED_INTERNAL
+#include <FastLED.h>
 #include "solar_protocol.h"
 
 // ----------------------------- Pin map (from spec) --------------------------
@@ -45,9 +47,15 @@ static const uint8_t PIN_MOTOR_PWR  = 5;   // (freed by dropping the spin motor)
                                            // MOSFET / load switch feeding VM to the TMC drivers.
                                            // HIGH = motor supply on; LOW = drivers fully asleep.
 static const uint8_t PIN_HOME       = 6;   // homing sensor, active-low, FALLING pulse/rev
-static const uint8_t PIN_LIGHT_EN   = 7;   // N-MOS gate for planet light
+#define PIN_LIGHT_EN       7               // WS2812 data line for the planet light (was an N-MOS gate)
 static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
 static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
+
+// Planet light: a WS2812 strip on PIN_LIGHT_EN. The Sun sends a per-planet RGB colour; the cart
+// shows it when its light is on (per the show's lighting logic) and goes dark when off.
+#define LIGHT_NUM_LEDS     1               // WS2812 pixels on the light line (raise for a ring/strip)
+#define LIGHT_LED_TYPE     WS2812B
+#define LIGHT_LED_ORDER    GRB
 
 // ----------------------------- Motor / TMC config ---------------------------
 #define TMC_R_SENSE        0.11f
@@ -64,29 +72,8 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define LEDC_CLK_HZ        80000000.0      // APB clock feeding LEDC
 #define WHEEL_RAMP_S       1.0f            // seconds to accelerate 0->commanded speed (and back)
 #define WHEEL_UPDATE_MS    20              // how often the software frequency ramp advances
-// StallGuard "stuck" detection uses a threshold sent from the Sun (settings: stall_threshold,
-// runtime g_stallThreshold): if the StallGuard load drops below it while a wheel is commanded to
-// move, the rotor is mechanically held. TMC2209 StallGuard needs per-rig tuning — watch sg=x/y in
-// the serial heartbeat / the Sun UI and set the threshold a little above the "held" reading but
-// below the free-running reading. 0 disables the check.
-#define FAULT_DEBOUNCE     3               // consecutive bad polls before a fault is latched
-// Stall detection uses a RUNNING AVERAGE of the StallGuard load per wheel, because a single
-// SG_RESULT sample is noisy and reads low at low RPM (unreliable for a bare threshold). The EMA
-// is (re)armed at SG_AVG_INIT_MULT * threshold, so only several consecutive low readings pull it
-// under the threshold -> a stall is declared (this also spaces out the auto-retry attempts).
-#define SG_AVG_ALPHA       0.30f           // EMA weight per fault poll (higher = reacts faster)
-#define SG_AVG_INIT_MULT   5               // arm the average at this * stall_threshold
-#define STALL_RESTART_MS   800             // pause after the hard stop before spinning up again
-// Open-load / disconnected-motor detection. A single SG_RESULT sample and the OLA/OLB flags are
-// unreliable at low RPM (they flicker), so we watch the StealthChop auto-current regulator instead:
-// with an open winding it CANNOT reach the commanded current, so PWM_SCALE_SUM pins at its 255
-// ceiling and PWM_SCALE_AUTO rails high. A connected coil regulates with a small, bounded auto term
-// at any speed. Measured on the rig (400 mA, 50 rpm): connected sum 44-166 / auto -39..+30 ;
-// disconnected sum 255 / auto 152-223. Requiring BOTH avoids a high-speed false positive (where a
-// connected coil's sum can rise while auto stays low). In SpreadCycle, OLA/OLB are used (reliable
-// there while moving) since PWM autoscale is a StealthChop feature.
-#define PWM_OPEN_SUM       250             // PWM_SCALE_SUM at/above this (near 255 ceiling) = saturated
-#define PWM_OPEN_AUTO      100             // and PWM_SCALE_AUTO railed this high = can't reach current
+// NOTE: motor stuck / disconnected sensing was removed — the TMC2209 StallGuard and open-load
+// signals are not reliable in this installation's quiet (stealthChop) low-RPM operating regime.
 
 // ----------------------------- Radio / power --------------------------------
 // The C3 runs warm because its Wi-Fi radio is always on for ESP-NOW. Two levers reduce it:
@@ -103,12 +90,15 @@ static uint16_t g_microsteps  = 16;        // 1..256 (uint16: 256 does not fit i
 static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev = 360/step_degree
 static bool     g_spread      = false;     // chopper: false = stealthChop (quiet), true = spreadCycle
 static bool     g_interpolate = true;      // MicroPlyer: interpolate microsteps up to 256 internally
-static uint16_t g_stallThreshold = 0;      // StallGuard load below this while driving = stuck (0=off)
 static bool     g_cfgOk       = false;     // last applyDriverParams() verified over UART?
 
 HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
 TMC2209Stepper   drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
+
+// Planet light (WS2812 on PIN_LIGHT_EN). g_lightColor is the Sun-chosen colour; shown when on.
+static CRGB     g_lightLeds[LIGHT_NUM_LEDS];
+static CRGB     g_lightColor = CRGB::White;
 
 // ----------------------------- Runtime state --------------------------------
 enum PlanetState : uint8_t { ST_OFFLINE, ST_IDLE, ST_ACTIVE };
@@ -118,7 +108,6 @@ static uint8_t  g_myIndex     = PLANET_INDEX_UNKNOWN;
 static bool     g_motorsOn    = false;     // drivers enabled (VM on, EN low)
 static bool     g_lightOn     = false;
 static bool     g_homingStop  = false;     // true while executing CMD_HOME_AND_STOP
-static uint8_t  g_error       = ERR_NONE;
 
 // Wheel velocity ramp (µsteps/s, signed = direction). A SINGLE ramp fraction scales both wheels
 // from their start velocity to their final target, so the L:R speed ratio is preserved throughout
@@ -144,14 +133,9 @@ static bool     g_pendingInterp  = true;
 // Diagnostics reported back to the Sun and printed in the heartbeat.
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
-static uint16_t g_sgL = 0, g_sgR = 0;      // last StallGuard load readings (for tuning)
-static float    g_sgAvgL = 0, g_sgAvgR = 0;// running (EMA) StallGuard load per wheel
-static uint32_t g_faultRecoverMs = 0;      // when !=0: millis() at which to spin up again after a motor fault
-static uint8_t  g_drvStat = 0;             // last open-load/overtemp flag snapshot (bitfield)
 
 static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
 static uint32_t g_nextStatusMs = 0;        // next scheduled status transmit
-static uint32_t g_lastFaultMs = 0;         // last TMC fault poll
 static uint32_t g_channelScanMs = 0;       // last channel (re)scan while offline
 static uint32_t g_lastDbgMs   = 0;         // periodic debug heartbeat print
 
@@ -180,14 +164,6 @@ static inline uint8_t rssiPct(int8_t rssi) {
   if (rssi == 0) return 0;                       // unknown
   int p = 2 * (rssi + 100);
   return (uint8_t)constrain(p, 0, 100);
-}
-
-static const char *errText(uint8_t e) {
-  switch (e) {
-    case ERR_MOTOR_DISCONNECTED: return "MOTOR_DISCONNECTED";
-    case ERR_MOTOR_STUCK:        return "MOTOR_STUCK";
-    default:                     return "OK";
-  }
 }
 
 // ESP32-C3 built-in temperature sensor (die temp; reads ~10-20 °C above ambient from self-heat).
@@ -268,9 +244,9 @@ static void applyDriverParams() {
   bool okL = applyOneDriverVerified(drvL, 'L', 3);
   bool okR = applyOneDriverVerified(drvR, 'R', 3);
   g_cfgOk = okL && okR;
-  Serial.printf("driver cfg %s: I=%umA usteps=%u mode=%s mplyer=%d stall_thr=%u\n",
+  Serial.printf("driver cfg %s: I=%umA usteps=%u mode=%s mplyer=%d\n",
                 g_cfgOk ? "VERIFIED" : "UNVERIFIED(!)", g_currentMa, g_microsteps,
-                g_spread ? "spread" : "stealth", g_interpolate, g_stallThreshold);
+                g_spread ? "spread" : "stealth", g_interpolate);
 }
 
 static void tmcBringup() {
@@ -282,17 +258,8 @@ static void tmcBringup() {
     d->pdn_disable(true);       // required so UART (not the PDN pin) controls the driver
     d->I_scale_analog(false);   // internal Vref (ignore VREF pin)
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
-    d->pwm_autoscale(true);     // StealthChop auto current regulation (needed for open-load sensing)
-    d->pwm_autograd(true);
   }
   applyDriverParams();
-}
-
-// (Re)arm the running StallGuard average to its high init value (SG_AVG_INIT_MULT * threshold), so
-// a fresh spin-up must gather several low readings before the average trips a stall.
-static inline void resetSgAvg() {
-  float init = (float)g_stallThreshold * SG_AVG_INIT_MULT;
-  g_sgAvgL = g_sgAvgR = init;
 }
 
 // Enable/disable the drivers. Levers, strongest first:
@@ -305,7 +272,6 @@ static void motorsEnable(bool on) {
     delayMicroseconds(1500);                    // let VM settle before driving
     drvL.toff(4); drvR.toff(4);                 // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
-    resetSgAvg();                               // start the stall average high (needs low run to trip)
   } else {
     ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);   // STEP lines low: stop the step trains
     g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
@@ -317,9 +283,19 @@ static void motorsEnable(bool on) {
   g_motorsOn = on;
 }
 
+// Drive the WS2812 light: show g_lightColor when on, else go dark. (A single FastLED.show() is a
+// short RMT burst — it never disturbs the LEDC step train, which is pure hardware.)
+static void lightRender() {
+  fill_solid(g_lightLeds, LIGHT_NUM_LEDS, g_lightOn ? g_lightColor : CRGB::Black);
+  FastLED.show();
+}
 static void lightSet(bool on) {
-  digitalWrite(PIN_LIGHT_EN, on ? HIGH : LOW);
   g_lightOn = on;
+  lightRender();
+}
+static void lightSetColor(uint8_t r, uint8_t g, uint8_t b) {
+  g_lightColor = CRGB(r, g, b);
+  if (g_lightOn) lightRender();
 }
 
 static inline bool wheelsMoving() {
@@ -425,8 +401,7 @@ static void serviceCommand() {
 
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
-  g_stallThreshold = m.stall_threshold;     // stuck-detection threshold (0 = disabled)
-  g_faultRecoverMs = 0;                      // a fresh command supersedes any pending auto-retry
+  lightSetColor(m.light_r, m.light_g, m.light_b);   // per-planet colour chosen on the Sun
 
   // Unpack the driver-config byte (microsteps enum + chopper + MicroPlyer bits).
   uint16_t effUs = solarMicrostepsFromEnum(m.driver_cfg & 0x0F);
@@ -503,14 +478,13 @@ static void sendStatus() {
   s.type         = SOLAR_MSG_STATUS;
   s.planet_index = g_myIndex;
   s.home_pulsed  = g_homePulse ? 1 : 0;
-  s.error        = g_error;
+  s.error        = ERR_NONE;                 // motor stuck/disconnected sensing was removed
   s.light_on     = g_lightOn ? 1 : 0;
   s.moving       = wheelsMoving() ? 1 : 0;
   g_dieTempC     = readDieTempC();
   s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
   s.rssi         = g_sunRssi;
   s.cfg_ok       = g_cfgOk ? 1 : 0;
-  s.sg_load      = (g_sgL < g_sgR) ? g_sgL : g_sgR;   // worst-case (lowest) wheel load
   g_homePulse    = false;
 
   const uint8_t *dst = g_sunKnown ? g_sunMac : BCAST_MAC;
@@ -553,102 +527,6 @@ static void serviceStatusLed() {
   uint32_t period = onMs + offMs;
   bool on = (millis() % period) < onMs;
   digitalWrite(PIN_STATUS_LED, on ? LOW : HIGH);        // active-low
-}
-
-// Is this driver's winding open (motor disconnected / broken coil) while it is being driven?
-// StealthChop: the PWM autoscaler saturates (sum pinned at the 255 ceiling AND the auto term
-// railed) because it cannot force the commanded current into an open coil. SpreadCycle: fall back
-// to the OLA/OLB flags, which are reliable there while moving (PWM autoscale is StealthChop-only).
-static bool coilOpen(TMC2209Stepper &d, bool moving) {
-  if (!moving) return false;                           // only meaningful while the coil is driven
-  if (g_spread) return d.ola() || d.olb();
-  return (d.pwm_scale_sum() >= PWM_OPEN_SUM) && (d.pwm_scale_auto() >= PWM_OPEN_AUTO);
-}
-
-// A motor fault (StallGuard stall OR a disconnect/open-load) means we can't trust the motion. Stop
-// the cart INSTANTLY (no decel ramp): kill both step trains and disable the drivers, report the
-// fault right away, then schedule a fresh spin-up (as if a new RUN arrived) as long as the Sun
-// still wants us moving. The status is pushed immediately so the Sun registers the fault even
-// though it clears again the moment the drivers go idle. Both stuck and disconnected motors get
-// this same stop-and-retry treatment.
-static void handleMotorFault(uint8_t err) {
-  Serial.printf("%s (sgAvg L=%.0f R=%.0f thr=%u): hard stop + retry\n",
-                errText(err), g_sgAvgL, g_sgAvgR, g_stallThreshold);
-  g_error = err;
-  ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);    // instant: STEP lines low, no deceleration
-  g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
-  g_velFinalL = g_velFinalR = 0; g_actHzL = g_actHzR = 0; g_rampFrac = 1.0f;
-  g_resumePending = false; g_stopThenOff = false;
-  sendStatus();                                        // make sure the Sun sees the fault
-  motorsEnable(false);                                 // disable outputs + cut VM
-  bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
-  g_faultRecoverMs = wantMotion ? (millis() + STALL_RESTART_MS) : 0;
-}
-
-// ----------------------------- Fault polling --------------------------------
-// TMC2209 fault sensing is inherently limited: test_connection() only proves the *driver chip*
-// answers over UART (it stays "OK" if you unplug just the motor coils), and open-load /
-// StallGuard flags are only meaningful while the coils are actually being driven. So we sample
-// them only when the motor is enabled and moving, and require several consecutive bad polls
-// (FAULT_DEBOUNCE) before latching a disconnect. Stall uses a running SG average (see below).
-static void serviceFaults() {
-  if (millis() - g_lastFaultMs < 500) return;
-  g_lastFaultMs = millis();
-
-  static uint8_t discCnt = 0;
-  if (!g_motorsOn) {                     // drivers asleep (VM may be cut): nothing valid to read
-    if (g_error != ERR_MOTOR_STUCK && g_error != ERR_MOTOR_DISCONNECTED)
-      g_error = ERR_NONE;                // keep a just-set fault latched until recovery re-accelerates
-    g_sgL = g_sgR = 0; g_drvStat = 0; discCnt = 0;
-    return;
-  }
-  bool driving = g_motorsOn && wheelsMoving();
-  bool lMoving = fabsf(g_velCurL) > 1.0f;
-  bool rMoving = fabsf(g_velCurR) > 1.0f;
-
-  // Snapshot StallGuard load for the stall average/heartbeat.
-  g_sgL = drvL.SG_RESULT();
-  g_sgR = drvR.SG_RESULT();
-
-  // Disconnected motor / open winding, sensed per wheel via the StealthChop PWM autoscaler (see
-  // coilOpen). Reliable down to low RPM, unlike the OLA/OLB flags we used before. Also latch the
-  // over-temp flags into g_drvStat for the heartbeat/UI.
-  bool openL = coilOpen(drvL, lMoving);
-  bool openR = coilOpen(drvR, rMoving);
-  g_drvStat = (openL ? 0x01 : 0) | (openR ? 0x04 : 0) |
-              (drvL.ot() ? 0x10 : 0) | (drvR.ot() ? 0x20 : 0);
-
-  bool commsBad = (drvL.test_connection() != 0) || (drvR.test_connection() != 0);
-  bool disc     = commsBad || openL || openR;
-
-  // Running StallGuard average per wheel. SG_RESULT is noisy and reads low at low RPM, so we only
-  // fold samples into the EMA once the wheel is AT its commanded speed (ramp settled); during the
-  // accel ramp the average stays parked at its high init value (no false trips while speeding up).
-  bool atSpeed = driving && (g_rampFrac >= 1.0f);
-  if (atSpeed && lMoving) g_sgAvgL += SG_AVG_ALPHA * ((float)g_sgL - g_sgAvgL);
-  if (atSpeed && rMoving) g_sgAvgR += SG_AVG_ALPHA * ((float)g_sgR - g_sgAvgR);
-
-  bool stuck = (g_stallThreshold > 0) && atSpeed && !disc &&
-               ((lMoving && g_sgAvgL < (float)g_stallThreshold) ||
-                (rMoving && g_sgAvgR < (float)g_stallThreshold));
-
-  discCnt = disc ? (uint8_t)(discCnt + 1) : 0;
-  if (discCnt >= FAULT_DEBOUNCE) { handleMotorFault(ERR_MOTOR_DISCONNECTED); return; }
-  if (stuck)                     { handleMotorFault(ERR_MOTOR_STUCK); return; }
-  g_error = ERR_NONE;                                  // healthy (or still accelerating)
-}
-
-// Finish a motor-fault recovery: after the brief post-stop pause, re-enable and ramp back up to the
-// last commanded speed — but only while the Sun still wants motion and the cart is still online. (A
-// fresh command that arrives during the pause clears g_faultRecoverMs and restarts us itself.)
-static void serviceFaultRecover() {
-  if (!g_faultRecoverMs || (int32_t)(millis() - g_faultRecoverMs) < 0) return;
-  g_faultRecoverMs = 0;
-  bool wantMotion = (fabsf(g_cmdWheelL) > 0.01f) || (fabsf(g_cmdWheelR) > 0.01f);
-  if (!wantMotion || g_state == ST_OFFLINE) return;
-  Serial.printf("motor-fault recovery: re-accelerating to L=%.0f R=%.0f rpm\n", g_cmdWheelL, g_cmdWheelR);
-  motorsEnable(true);
-  wheelSetTargets(g_cmdWheelL, g_cmdWheelR);
 }
 
 // ----------------------------- Homing ---------------------------------------
@@ -709,7 +587,8 @@ void setup() {
   // sets the actual step rate with a per-frequency resolution for accuracy; start silent (duty 0).
   ledcSetup(LEDC_CH_L, 1000, 8); ledcAttachPin(PIN_STEP_L, LEDC_CH_L); ledcWrite(LEDC_CH_L, 0);
   ledcSetup(LEDC_CH_R, 1000, 8); ledcAttachPin(PIN_STEP_R, LEDC_CH_R); ledcWrite(LEDC_CH_R, 0);
-  pinMode(PIN_LIGHT_EN, OUTPUT);   digitalWrite(PIN_LIGHT_EN, LOW);
+  FastLED.addLeds<LIGHT_LED_TYPE, PIN_LIGHT_EN, LIGHT_LED_ORDER>(g_lightLeds, LIGHT_NUM_LEDS);
+  lightSet(false);                 // WS2812 light dark until the Sun turns it on
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);
   pinMode(PIN_HOME, INPUT_PULLUP);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -742,8 +621,6 @@ void loop() {
   serviceCommand();
   serviceHoming();
   serviceRamp();
-  serviceFaults();
-  serviceFaultRecover();
 
   // Periodic status transmit, jittered 1-3s to avoid collisions among the 8 carts.
   if (now >= g_nextStatusMs) {
@@ -771,15 +648,15 @@ void loop() {
     float rpmL = g_actHzL / (fullSteps * g_microsteps) * 60.0f * (g_velCurL < 0 ? -1 : 1);
     float rpmR = g_actHzR / (fullSteps * g_microsteps) * 60.0f * (g_velCurR < 0 ? -1 : 1);
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%d | "
-                  "TMC:%s I=%umA usteps=%u %s%s sg=%u/%u ol=0x%02X | "
+                  "TMC:I=%umA usteps=%u %s%s cfg=%d | "
                   "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz) | "
-                  "light=%d motors=%d\n",
+                  "light=%d(%02X%02X%02X) motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? 1 : 0,
-                  errText(g_error), g_currentMa, g_microsteps,
-                  g_spread ? "spread" : "stealth", g_interpolate ? " mplyer" : "",
-                  g_sgL, g_sgR, g_drvStat, g_cmdWheelL, g_cmdWheelR,
-                  rpmL, rpmR, g_actHzL, g_actHzR,
-                  g_lightOn ? 1 : 0, g_motorsOn ? 1 : 0);
+                  g_currentMa, g_microsteps,
+                  g_spread ? "spread" : "stealth", g_interpolate ? " mplyer" : "", g_cfgOk ? 1 : 0,
+                  g_cmdWheelL, g_cmdWheelR, rpmL, rpmR, g_actHzL, g_actHzR,
+                  g_lightOn ? 1 : 0, g_lightColor.r, g_lightColor.g, g_lightColor.b,
+                  g_motorsOn ? 1 : 0);
   }
 }

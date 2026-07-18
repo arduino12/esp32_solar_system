@@ -26,12 +26,12 @@
 #include "sun_web_ui.h"
 
 // ----------------------------- Pin map (from spec) --------------------------
-static const uint8_t PIN_LED         = 4;   // WS2812 data
-static const uint8_t PIN_BTN_START   = 5;   // Start button, active-low
+static const uint8_t PIN_LED         = 14;  // WS2812 data
+static const uint8_t PIN_BTN_START   = 25;  // Start button, active-low
 static const uint8_t PIN_BTN_BOOT    = 0;   // onboard boot button, active-low (5s hold = factory reset)
 
 // ----------------------------- LED config -----------------------------------
-#define NUM_LEDS        60
+#define NUM_LEDS        45
 #define LED_TYPE        WS2812B
 #define LED_ORDER       GRB
 static CRGB      g_leds[NUM_LEDS];
@@ -61,11 +61,11 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
   },
   "planets": {
     "mac_address": ["","","","","","","",""],
+    "colors": ["#f4d35e","#e07a5f","#81b29a","#5f9ea0","#c77dff","#6ca6ff","#f28482","#b5e48c"],
     "wheels": {
       "diameter_mm": 36,
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
                    "chopper_mode": "stealth", "microplyer": true,
-                   "stall_threshold": [10,10,10,10,10,10,10,10],
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
     },
     "rail": {
@@ -100,7 +100,6 @@ struct PlanetState {
   int8_t   tempC;         // planet die temperature, °C (reported by the cart)
   int8_t   rssi;          // planet<->Sun signal, dBm (reported by the cart)
   bool     cfgOk;         // planet verified its last driver-param apply over UART
-  uint16_t sgLoad;        // planet's last StallGuard load reading (for stall tuning)
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
 
@@ -204,15 +203,21 @@ static void migrateSettings() {
     changed = true;
     Serial.println("Migrated settings: inner_diameter_mm -> outer_diameter_mm (+2*width)");
   }
-  // stall_threshold: scalar -> per-cart array. Spread the old scalar (or 10) across all 8 slots.
+  // stall_threshold: the motor stuck/disconnected sensing was dropped, so remove the dead setting.
   JsonObject st = g_settings["planets"]["wheels"]["stepper"].as<JsonObject>();
-  if (!st.isNull() && !st["stall_threshold"].isNull() && !st["stall_threshold"].is<JsonArray>()) {
-    uint16_t v = st["stall_threshold"] | 10;
+  if (!st.isNull() && !st["stall_threshold"].isNull()) {
     st.remove("stall_threshold");
-    JsonArray arr = st["stall_threshold"].to<JsonArray>();
-    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) arr.add(v);
     changed = true;
-    Serial.println("Migrated settings: stall_threshold scalar -> per-cart array");
+    Serial.println("Migrated settings: removed obsolete stall_threshold");
+  }
+  // colors: per-planet WS2812 light colour. Seed with the UI palette on old files that lack it.
+  if (!planets.isNull() && planets["colors"].isNull()) {
+    const char *pal[SOLAR_PLANET_COUNT] = {"#f4d35e","#e07a5f","#81b29a","#5f9ea0",
+                                           "#c77dff","#6ca6ff","#f28482","#b5e48c"};
+    JsonArray cols = planets["colors"].to<JsonArray>();
+    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) cols.add(pal[k]);
+    changed = true;
+    Serial.println("Migrated settings: added planets.colors");
   }
   if (changed) saveSettings();
 }
@@ -283,12 +288,8 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (!s.cfg_ok && p.cfgOk)             // config verification just failed on the cart
     addLog("Planet " + String(idx) + " driver cfg UNVERIFIED (UART)");
   p.cfgOk      = s.cfg_ok;
-  p.sgLoad     = s.sg_load;
   if (s.home_pulsed) p.homeCount++;
-  if (s.error != p.error && s.error != ERR_NONE)
-    addLog("Planet " + String(idx) + (s.error == ERR_MOTOR_DISCONNECTED ? " motor disconnected"
-                                                                        : " motor stuck"));
-  p.error = s.error;
+  p.error = s.error;                    // always ERR_NONE now (fault sensing removed)
 }
 
 static void addPeer(const uint8_t *mac) {
@@ -321,6 +322,16 @@ static uint8_t packDriverCfg(JsonObject pl) {
   return solarPackDriverCfg(ms, spread, interp);
 }
 
+// Fill the CmdMsg light colour for planet i from the settings "colors" array ("#rrggbb" hex).
+static void setCmdColor(CmdMsg &m, int i) {
+  const char *hex = g_settings["planets"]["colors"][i] | "#ffffff";
+  if (hex[0] == '#') hex++;
+  long v = strtol(hex, nullptr, 16);
+  m.light_r = (uint8_t)((v >> 16) & 0xFF);
+  m.light_g = (uint8_t)((v >> 8) & 0xFF);
+  m.light_b = (uint8_t)(v & 0xFF);
+}
+
 // Given the per-rail OUTER wheel speed, compute the two wheel speeds so the cart rolls around the
 // ring, and the resulting orbital speed for the web animation. log_scale_speed_rpm is the OUTER
 // (faster) wheel; the inner rail is smaller by 2*width_mm, so the inner wheel turns proportionally
@@ -350,10 +361,10 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_l_rpm = wheelL * sign;
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
+  setCmdColor(m, i);
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
-  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"][i] | 10;
   return m;
 }
 
@@ -363,10 +374,10 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_CMD; m.planet_index = i;
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
+  setCmdColor(m, i);
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
-  m.stall_threshold = pl["wheels"]["stepper"]["stall_threshold"][i] | 10;
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
     float outerD = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
@@ -612,7 +623,6 @@ static void buildStatusJson(String &out) {
       o["rssi"]     = r;
       o["rssi_pct"] = r ? constrain(2 * (r + 100), 0, 100) : 0;   // -100dBm=0%, -50dBm=100%
       o["cfg_ok"]   = g_planet[i].cfgOk;
-      o["sg_load"]  = g_planet[i].sgLoad;
     }
   }
 
