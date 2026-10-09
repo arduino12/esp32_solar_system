@@ -575,6 +575,11 @@ static void updateState() {
 // ----------------------------- Setup / loop ----------------------------------
 void setup() {
   Serial.begin(115200);
+  // Native USB serial (HWCDC) WAITS while its TX buffer is full - i.e. whenever
+  // USB is plugged into a computer that isn't reading the port - for up to the
+  // TX timeout per print (100 ms on core 2.0.x, 2 s on 3.x). That stalls the
+  // motor loop. 0: a full buffer drops the text instead; nothing ever waits.
+  Serial.setTxTimeoutMs(0);
   uint32_t tUsb = millis();                // wait for the USB-CDC host to attach so the
   while (!Serial && millis() - tUsb < 3000) delay(10);   // boot banner isn't lost
   delay(300);
