@@ -62,8 +62,10 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 #define TMC_UART_BAUD      115200
 #define TMC_ADDR_L         0b11            // MS1=VIO MS2=VIO
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
-#define WHEEL_R_INVERT     true            // wheels are mounted back-to-back: flip the right one
-                                           // so a "forward" command rolls both the same way.
+#define WHEEL_R_INVERT     false           // true flips the right wheel. The first cart (wheels
+                                           // back-to-back) needed true; the new cart PCB rolls
+                                           // both wheels the same way without the flip.
+#define TMC_READY_TIMEOUT_MS 300           // max wait for the drivers to answer after VM switches on
 // LEDC step generation. Channels must sit on DIFFERENT timers to run at independent speeds
 // (timer = channel/2, one frequency per timer): ch0->timer0, ch2->timer1. Both timers still
 // derive from the single 80 MHz APB clock, so the L:R frequency ratio stays exact (synchronized).
@@ -91,6 +93,7 @@ static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev
 static bool     g_spread      = false;     // chopper: false = stealthChop (quiet), true = spreadCycle
 static bool     g_interpolate = true;      // MicroPlyer: interpolate microsteps up to 256 internally
 static bool     g_cfgOk       = false;     // last applyDriverParams() verified over UART?
+static bool     g_cfgStale    = false;     // params changed while asleep -> apply on next wake
 
 HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
@@ -249,8 +252,19 @@ static void applyDriverParams() {
                 g_spread ? "spread" : "stealth", g_interpolate);
 }
 
-static void tmcBringup() {
-  TMC_SERIAL.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_RX, PIN_TMC_TX);
+// The TMC2209 logic runs off its internal 5V regulator, i.e. off VM: with VM switched off the
+// drivers are unpowered and silent. Wait (bounded) until both answer (IOIN VERSION = 0x21).
+static bool driversReady(uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  do {
+    if (drvL.version() == 0x21 && drvR.version() == 0x21) return true;
+  } while (millis() - t0 < timeoutMs);
+  return false;
+}
+
+// Full driver config: GCONF (which also carries the shaft/direction bit) + all params, verified.
+// Then clear GSTAT.reset, so a later wake can tell whether a VM power cycle wiped the registers.
+static void driversConfigure() {
   TMC2209Stepper *all[2] = {&drvL, &drvR};
   for (auto *d : all) {
     d->begin();
@@ -260,16 +274,43 @@ static void tmcBringup() {
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
   }
   applyDriverParams();
+  drvL.GSTAT(0b111); drvR.GSTAT(0b111);         // write-1-to-clear reset/drv_err/uv_cp
+  g_cfgStale = false;
+}
+
+// Take new driver params from a command. With the motor supply asleep the drivers can't be written,
+// so just mark the config stale; motorsEnable(true) applies it on wake.
+static void driverParamsSet(uint16_t ma, uint16_t us, bool spread, bool interp) {
+  g_currentMa = ma; g_microsteps = us; g_spread = spread; g_interpolate = interp;
+  if (g_motorsOn) applyDriverParams();
+  else            g_cfgStale = true;
+}
+
+// Boot: power VM just long enough to configure + verify the drivers (EN stays high, so the outputs
+// stay off and no motor current flows), then put the motor supply back to sleep.
+static void tmcBringup() {
+  TMC_SERIAL.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_RX, PIN_TMC_TX);
+  digitalWrite(PIN_MOTOR_PWR, HIGH);
+  if (driversReady(TMC_READY_TIMEOUT_MS)) driversConfigure();
+  else { g_cfgOk = false; Serial.println("TMC drivers not answering on UART (VM missing?)"); }
+  digitalWrite(PIN_MOTOR_PWR, LOW);
 }
 
 // Enable/disable the drivers. Levers, strongest first:
 //   1. PIN_MOTOR_PWR cuts the motor supply (VM) entirely when idle — true sleep, ~zero draw.
-//      VCC_IO stays on 3.3V so the TMC register config survives and needs no re-init on wake.
+//      Where that really removes VM the drivers reset to OTP defaults (wrong microsteps, current,
+//      direction), so every wake checks GSTAT.reset and re-configures them before driving.
 //   2. EN pin high disables the output stage.  3. toff=0 gates the chopper off.
 static void motorsEnable(bool on) {
   if (on) {
     digitalWrite(PIN_MOTOR_PWR, HIGH);          // wake: motor supply on
-    delayMicroseconds(1500);                    // let VM settle before driving
+    if (!driversReady(TMC_READY_TIMEOUT_MS)) {
+      g_cfgOk = false;
+      Serial.println("wake: TMC drivers not answering on UART (VM missing?)");
+    } else if (g_cfgStale || !g_cfgOk || drvL.reset() || drvR.reset()) {
+      Serial.println("wake: drivers reset by VM power-up (or params changed) -> configuring");
+      driversConfigure();
+    }
     drvL.toff(4); drvR.toff(4);                 // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
   } else {
@@ -435,11 +476,7 @@ static void serviceCommand() {
         g_pendingRpmL = m.wheel_l_rpm; g_pendingRpmR = m.wheel_r_rpm;
         wheelSetTargets(0, 0);
       } else if (!g_resumePending) {
-        if (paramsChanged) {
-          g_currentMa = m.current_ma; g_microsteps = effUs;
-          g_spread = spread; g_interpolate = interp;
-          applyDriverParams();
-        }
+        if (paramsChanged) driverParamsSet(m.current_ma, effUs, spread, interp);
         bool wasOff = !g_motorsOn;
         if (wasOff) motorsEnable(true);
         // The Sun re-sends the same CMD_RUN every ~2 s as a heartbeat; only (re)start the ramp on a
@@ -453,11 +490,7 @@ static void serviceCommand() {
 
     case CMD_HOME_AND_STOP:           // drive slowly toward HOME; homing logic stops on the pulse
       g_resumePending = false; g_stopThenOff = false;
-      if (paramsChanged) {
-        g_currentMa = m.current_ma; g_microsteps = effUs;
-        g_spread = spread; g_interpolate = interp;
-        applyDriverParams();
-      }
+      if (paramsChanged) driverParamsSet(m.current_ma, effUs, spread, interp);
       if (!g_homingStop) g_homeSeen = false;    // clear on entry only, not every heartbeat
       g_homingStop = true;
       if (!g_motorsOn) motorsEnable(true);
