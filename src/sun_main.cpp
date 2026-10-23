@@ -69,7 +69,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
     },
     "rail": {
-      "width_mm": 70,
+      "width_mm": 60,
       "outer_diameter_mm": [640,740,840,940,1040,1140,1240,1340],
       "log_scale_speed_rpm": [300,270,200,120,104,62,38,22]
     }
