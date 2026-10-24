@@ -72,9 +72,8 @@ struct __attribute__((packed)) CmdMsg {
   float    wheel_l_rpm;   // left wheel (outer track, faster); sign = direction
   float    wheel_r_rpm;   // right wheel (inner track, slower); sign = direction
   uint8_t  light_on;      // 0/1
-  uint8_t  light_r;       // WS2812 colour to show when light_on (per-planet, set on the Sun)
-  uint8_t  light_g;
-  uint8_t  light_b;
+  uint8_t  light_brightness; // 0..100 % when light_on (perceptual; the cart applies gamma)
+  uint8_t  light_reserved[2]; // was the WS2812 G/B bytes: kept so the message size is unchanged
   uint16_t current_ma;    // TMC rms current to apply to all drivers
   uint8_t  driver_cfg;    // packed TMC params: see SOLAR_DRVCFG_* / solarPackDriverCfg()
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev

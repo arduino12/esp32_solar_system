@@ -33,8 +33,6 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <TMCStepper.h>
-#define FASTLED_INTERNAL
-#include <FastLED.h>
 #include "solar_protocol.h"
 
 // ----------------------------- Pin map (from spec) --------------------------
@@ -47,15 +45,17 @@ static const uint8_t PIN_MOTOR_PWR  = 5;   // (freed by dropping the spin motor)
                                            // MOSFET / load switch feeding VM to the TMC drivers.
                                            // HIGH = motor supply on; LOW = drivers fully asleep.
 static const uint8_t PIN_HOME       = 6;   // homing sensor, active-low, FALLING pulse/rev
-#define PIN_LIGHT_EN       7               // WS2812 data line for the planet light (was an N-MOS gate)
+static const uint8_t PIN_LIGHT_EN   = 7;   // N-MOS gate switching the high-power planet LED (PWM)
 static const uint8_t PIN_STATUS_LED = 8;   // onboard LED, active-low
 static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 
-// Planet light: a WS2812 strip on PIN_LIGHT_EN. The Sun sends a per-planet RGB colour; the cart
-// shows it when its light is on (per the show's lighting logic) and goes dark when off.
-#define LIGHT_NUM_LEDS     1               // WS2812 pixels on the light line (raise for a ring/strip)
-#define LIGHT_LED_TYPE     WS2812B
-#define LIGHT_LED_ORDER    GRB
+// Planet light: one high-power LED behind an N-MOS on PIN_LIGHT_EN, dimmed by steady LEDC PWM.
+// The Sun sends a per-planet brightness (0..100 %, perceptual); the cart gamma-corrects it to a
+// duty, shows it when its light is on (per the show's lighting logic) and goes dark when off.
+#define LIGHT_LEDC_CH      4               // ch4 -> timer2: clear of the wheel step timers 0 and 1
+#define LIGHT_PWM_HZ       20000           // above hearing, no visible flicker
+#define LIGHT_PWM_BITS     11              // 80 MHz / 20 kHz = 4000 counts -> 11 bits is the max
+#define LIGHT_GAMMA        2.2f
 
 // ----------------------------- Motor / TMC config ---------------------------
 #define TMC_R_SENSE        0.11f
@@ -99,9 +99,7 @@ HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
 TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
 TMC2209Stepper   drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
 
-// Planet light (WS2812 on PIN_LIGHT_EN). g_lightColor is the Sun-chosen colour; shown when on.
-static CRGB     g_lightLeds[LIGHT_NUM_LEDS];
-static CRGB     g_lightColor = CRGB::White;
+static uint8_t  g_lightBrightness = 100;   // Sun-chosen brightness, 0..100 %; shown when on
 
 // ----------------------------- Runtime state --------------------------------
 enum PlanetState : uint8_t { ST_OFFLINE, ST_IDLE, ST_ACTIVE };
@@ -324,18 +322,24 @@ static void motorsEnable(bool on) {
   g_motorsOn = on;
 }
 
-// Drive the WS2812 light: show g_lightColor when on, else go dark. (A single FastLED.show() is a
-// short RMT burst — it never disturbs the LEDC step train, which is pure hardware.)
+// Drive the light: g_lightBrightness when on, else dark. Brightness is perceptual, so gamma maps it
+// to a PWM duty (50 % looks half as bright, not nearly full); any non-zero setting keeps >= 1 count.
+// (The core's ledcWrite treats the max count as fully on.)
 static void lightRender() {
-  fill_solid(g_lightLeds, LIGHT_NUM_LEDS, g_lightOn ? g_lightColor : CRGB::Black);
-  FastLED.show();
+  const uint32_t maxDuty = (1u << LIGHT_PWM_BITS) - 1;
+  uint32_t duty = 0;
+  if (g_lightOn && g_lightBrightness > 0) {
+    duty = (uint32_t)lroundf(powf(g_lightBrightness / 100.0f, LIGHT_GAMMA) * maxDuty);
+    if (duty < 1) duty = 1;
+  }
+  ledcWrite(LIGHT_LEDC_CH, duty);
 }
 static void lightSet(bool on) {
   g_lightOn = on;
   lightRender();
 }
-static void lightSetColor(uint8_t r, uint8_t g, uint8_t b) {
-  g_lightColor = CRGB(r, g, b);
+static void lightSetBrightness(uint8_t pct) {
+  g_lightBrightness = pct > 100 ? 100 : pct;
   if (g_lightOn) lightRender();
 }
 
@@ -442,7 +446,7 @@ static void serviceCommand() {
 
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
-  lightSetColor(m.light_r, m.light_g, m.light_b);   // per-planet colour chosen on the Sun
+  lightSetBrightness(m.light_brightness);           // per-planet brightness chosen on the Sun
 
   // Unpack the driver-config byte (microsteps enum + chopper + MicroPlyer bits).
   uint16_t effUs = solarMicrostepsFromEnum(m.driver_cfg & 0x0F);
@@ -607,6 +611,8 @@ static void updateState() {
 
 // ----------------------------- Setup / loop ----------------------------------
 void setup() {
+  pinMode(PIN_LIGHT_EN, OUTPUT); digitalWrite(PIN_LIGHT_EN, LOW);   // light off at once: no floating
+                                                                    // MOSFET gate during the USB wait
   Serial.begin(115200);
   // Native USB serial (HWCDC) WAITS while its TX buffer is full - i.e. whenever
   // USB is plugged into a computer that isn't reading the port - for up to the
@@ -625,8 +631,8 @@ void setup() {
   // sets the actual step rate with a per-frequency resolution for accuracy; start silent (duty 0).
   ledcSetup(LEDC_CH_L, 1000, 8); ledcAttachPin(PIN_STEP_L, LEDC_CH_L); ledcWrite(LEDC_CH_L, 0);
   ledcSetup(LEDC_CH_R, 1000, 8); ledcAttachPin(PIN_STEP_R, LEDC_CH_R); ledcWrite(LEDC_CH_R, 0);
-  FastLED.addLeds<LIGHT_LED_TYPE, PIN_LIGHT_EN, LIGHT_LED_ORDER>(g_lightLeds, LIGHT_NUM_LEDS);
-  lightSet(false);                 // WS2812 light dark until the Sun turns it on
+  ledcSetup(LIGHT_LEDC_CH, LIGHT_PWM_HZ, LIGHT_PWM_BITS); ledcAttachPin(PIN_LIGHT_EN, LIGHT_LEDC_CH);
+  lightSet(false);                 // light dark until the Sun turns it on
   pinMode(PIN_STATUS_LED, OUTPUT); digitalWrite(PIN_STATUS_LED, HIGH);
   pinMode(PIN_HOME, INPUT_PULLUP);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
@@ -688,13 +694,13 @@ void loop() {
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%d | "
                   "TMC:I=%umA usteps=%u %s%s cfg=%d | "
                   "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz) | "
-                  "light=%d(%02X%02X%02X) motors=%d\n",
+                  "light=%d(%u%%) motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? 1 : 0,
                   g_currentMa, g_microsteps,
                   g_spread ? "spread" : "stealth", g_interpolate ? " mplyer" : "", g_cfgOk ? 1 : 0,
                   g_cmdWheelL, g_cmdWheelR, rpmL, rpmR, g_actHzL, g_actHzR,
-                  g_lightOn ? 1 : 0, g_lightColor.r, g_lightColor.g, g_lightColor.b,
+                  g_lightOn ? 1 : 0, g_lightBrightness,
                   g_motorsOn ? 1 : 0);
   }
 }

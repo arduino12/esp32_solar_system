@@ -61,7 +61,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
   },
   "planets": {
     "mac_address": ["","","","","","","",""],
-    "colors": ["#f4d35e","#e07a5f","#81b29a","#5f9ea0","#c77dff","#6ca6ff","#f28482","#b5e48c"],
+    "light_brightness_per": [100,100,100,100,100,100,100,100],
     "wheels": {
       "diameter_mm": 36,
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
@@ -210,14 +210,17 @@ static void migrateSettings() {
     changed = true;
     Serial.println("Migrated settings: removed obsolete stall_threshold");
   }
-  // colors: per-planet WS2812 light colour. Seed with the UI palette on old files that lack it.
-  if (!planets.isNull() && planets["colors"].isNull()) {
-    const char *pal[SOLAR_PLANET_COUNT] = {"#f4d35e","#e07a5f","#81b29a","#5f9ea0",
-                                           "#c77dff","#6ca6ff","#f28482","#b5e48c"};
-    JsonArray cols = planets["colors"].to<JsonArray>();
-    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) cols.add(pal[k]);
+  // colors -> light_brightness_per: the cart light is now one PWM-dimmed LED (N-MOS), not a WS2812.
+  if (!planets.isNull() && !planets["colors"].isNull()) {
+    planets.remove("colors");
     changed = true;
-    Serial.println("Migrated settings: added planets.colors");
+    Serial.println("Migrated settings: removed obsolete planets.colors");
+  }
+  if (!planets.isNull() && planets["light_brightness_per"].isNull()) {
+    JsonArray br = planets["light_brightness_per"].to<JsonArray>();
+    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) br.add(100);
+    changed = true;
+    Serial.println("Migrated settings: added planets.light_brightness_per");
   }
   if (changed) saveSettings();
 }
@@ -322,14 +325,10 @@ static uint8_t packDriverCfg(JsonObject pl) {
   return solarPackDriverCfg(ms, spread, interp);
 }
 
-// Fill the CmdMsg light colour for planet i from the settings "colors" array ("#rrggbb" hex).
-static void setCmdColor(CmdMsg &m, int i) {
-  const char *hex = g_settings["planets"]["colors"][i] | "#ffffff";
-  if (hex[0] == '#') hex++;
-  long v = strtol(hex, nullptr, 16);
-  m.light_r = (uint8_t)((v >> 16) & 0xFF);
-  m.light_g = (uint8_t)((v >> 8) & 0xFF);
-  m.light_b = (uint8_t)(v & 0xFF);
+// Fill the CmdMsg light brightness for planet i from the settings "light_brightness_per" array.
+static void setCmdLight(CmdMsg &m, int i) {
+  float pct = g_settings["planets"]["light_brightness_per"][i] | 100.0f;   // float: accepts 50 or 50.5
+  m.light_brightness = (uint8_t)lroundf(constrain(pct, 0.0f, 100.0f));
 }
 
 // Given the per-rail OUTER wheel speed, compute the two wheel speeds so the cart rolls around the
@@ -361,7 +360,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_l_rpm = wheelL * sign;
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
-  setCmdColor(m, i);
+  setCmdLight(m, i);
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
@@ -374,7 +373,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_CMD; m.planet_index = i;
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
-  setCmdColor(m, i);
+  setCmdLight(m, i);
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);

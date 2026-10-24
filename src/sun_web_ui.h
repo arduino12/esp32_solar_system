@@ -241,13 +241,12 @@ function render(key,val,path){
    f.appendChild(l);f.appendChild(mkInput(el,path.concat(i)));fs.appendChild(f);});
   return fs;
  }
- if(key==='colors'&&Array.isArray(val)){        // per-planet WS2812 light colour picker
+ if(key==='light_brightness_per'&&Array.isArray(val)){  // per-planet light brightness, 0..100 %
   const fs=document.createElement('fieldset');const lg=document.createElement('legend');
-  lg.textContent='light colors';fs.appendChild(lg);
+  lg.textContent='light brightness (%)';fs.appendChild(lg);
   val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
    const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
-   const inp=document.createElement('input');inp.type='color';inp.value=el;
-   inp.onchange=()=>setPath(cfg,path.concat(i),inp.value);
+   const inp=mkInput(el,path.concat(i));inp.min=0;inp.max=100;inp.step=1;
    f.appendChild(l);f.appendChild(inp);fs.appendChild(f);});
   return fs;
  }
