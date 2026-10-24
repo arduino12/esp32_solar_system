@@ -59,7 +59,8 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 // duty, shows it when its light is on (per the show's lighting logic) and goes dark when off.
 #define LIGHT_LEDC_CH      4               // ch4 -> timer2: clear of the wheel step timers 0 and 1
 #define LIGHT_PWM_HZ       20000           // above hearing, no visible flicker
-#define LIGHT_PWM_BITS     11              // 80 MHz / 20 kHz = 4000 counts -> 11 bits is the max
+#define LIGHT_PWM_BITS     10              // 20 kHz x 1024 = 20.5 MHz: fits the C3's 40 MHz LEDC
+                                           // clock (11 bits would need 41 MHz -> ledcSetup fails)
 #define LIGHT_GAMMA        2.2f
 
 // ----------------------------- Motor / TMC config ---------------------------
@@ -659,6 +660,8 @@ static void serviceFwDownload() {
     for (int k = 0; k < 3; k++) { sendStatus(); delay(150); }
     ESP.restart();
   }
+  now = millis();                                      // the writes above take time: re-read the
+                                                       // clock, or now - g_dlDataMs wraps negative
   if (!offered) { g_dlDataMs = now; return; }          // paused (show running): keep our place
   if (now - g_dlDataMs > FW_NO_DATA_MS) { fwStop(OTA_FAILED, OTA_ERR_NO_DATA); return; }
   if (g_dlGot >= FW_BURST || now - g_dlReqMs > FW_REQ_TIMEOUT_MS) fwRequest();
@@ -732,11 +735,12 @@ void setup() {
   pinMode(PIN_LIGHT_EN, OUTPUT); digitalWrite(PIN_LIGHT_EN, LOW);   // light off at once: no floating
                                                                     // MOSFET gate during the USB wait
   Serial.begin(115200);
-  // Native USB serial (HWCDC) WAITS while its TX buffer is full - i.e. whenever
-  // USB is plugged into a computer that isn't reading the port - for up to the
-  // TX timeout per print (100 ms on core 2.0.x, 2 s on 3.x). That stalls the
-  // motor loop. 0: a full buffer drops the text instead; nothing ever waits.
-  Serial.setTxTimeoutMs(0);
+  // Native USB serial (HWCDC) waits while its TX buffer is full - i.e. whenever USB is plugged
+  // into a computer that isn't reading the port - until the TX timeout, then treats the port as
+  // disconnected and drops output until the host reads again. Keep that wait to 1 ms. NOT 0: on
+  // core 2.0.17 write() counts its no-progress tries in a uint32 that starts at the timeout, so
+  // 0 wraps to ~4e9 and the cart's loop() freezes until someone opens the port.
+  Serial.setTxTimeoutMs(1);
   uint32_t tUsb = millis();                // wait for the USB-CDC host to attach so the
   while (!Serial && millis() - tUsb < 3000) delay(10);   // boot banner isn't lost
   delay(300);

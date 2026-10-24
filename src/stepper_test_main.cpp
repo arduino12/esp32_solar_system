@@ -586,11 +586,12 @@ static void setupWeb() {
 // ----------------------------- Setup / loop ----------------------------------
 void setup() {
   Serial.begin(115200);
-  // Native USB serial (HWCDC) WAITS while its TX buffer is full - i.e. whenever
-  // USB is plugged into a computer that isn't reading the port - for up to the
-  // TX timeout per print (100 ms on core 2.0.x, 2 s on 3.x). That stalls the
-  // motor loop. 0: a full buffer drops the text instead; nothing ever waits.
-  Serial.setTxTimeoutMs(0);
+  // Native USB serial (HWCDC) waits while its TX buffer is full - i.e. whenever USB is plugged
+  // into a computer that isn't reading the port - until the TX timeout, then treats the port as
+  // disconnected and drops output until the host reads again. Keep that wait to 1 ms. NOT 0: on
+  // core 2.0.17 write() counts its no-progress tries in a uint32 that starts at the timeout, so
+  // 0 wraps to ~4e9 and loop() freezes until someone opens the port.
+  Serial.setTxTimeoutMs(1);
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 2000) delay(10);
   delay(200);
