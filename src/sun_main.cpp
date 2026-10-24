@@ -116,6 +116,11 @@ static int    g_logHead = 0;
 AsyncWebServer server(80);
 static bool g_staOk = false;
 static uint32_t g_lastStaTryMs = 0;
+// STA link events, counted in the Wi-Fi event task and logged from loop(). A STA reconnect scans
+// every channel, which takes the AP and ESP-NOW off the planets' channel for seconds.
+static volatile uint32_t g_staDrops = 0, g_staUps = 0;
+static volatile uint8_t  g_staDropReason = 0;
+static uint32_t g_staDropsLogged = 0, g_staUpsLogged = 0;
 
 // ----------------------------- Small helpers ---------------------------------
 static String fmtUptime() {
@@ -558,6 +563,10 @@ static void serviceButtons() {
 // ----------------------------- Wi-Fi ------------------------------------------
 static void wifiStart() {
   WiFi.persistent(false);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    g_staDropReason = info.wifi_sta_disconnected.reason; g_staDrops++;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) { g_staUps++; }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
   WiFi.mode(WIFI_AP_STA);
   String apSsid = g_settings["wifi"]["ap_ssid"] | SOLAR_AP_SSID_DEFAULT;
   String apPass = g_settings["wifi"]["ap_pass"] | "didivardi";
@@ -574,6 +583,19 @@ static void wifiStart() {
   }
   Serial.printf("AP '%s' IP %s\n", apSsid.c_str(), WiFi.softAPIP().toString().c_str());
   if (g_staOk) Serial.printf("STA IP %s\n", WiFi.localIP().toString().c_str());
+}
+
+static void wifiLogEvents() {
+  if (g_staDrops != g_staDropsLogged) {
+    g_staDropsLogged = g_staDrops;
+    addLog("STA link lost (reason " + String(g_staDropReason) + ")");
+    Serial.printf("[%s] STA link lost, reason %u (drop #%lu)\n", fmtUptime().c_str(),
+                  g_staDropReason, (unsigned long)g_staDropsLogged);
+  }
+  if (g_staUps != g_staUpsLogged) {
+    g_staUpsLogged = g_staUps;
+    Serial.printf("[%s] STA got IP %s\n", fmtUptime().c_str(), WiFi.localIP().toString().c_str());
+  }
 }
 
 static void wifiRetry() {
@@ -770,6 +792,7 @@ void loop() {
   serviceButtons();
   serviceStateMachine();
   serviceLeds();
+  wifiLogEvents();
   wifiRetry();
   ElegantOTA.loop();
 
