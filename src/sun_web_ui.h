@@ -98,12 +98,9 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <input type="file" id="fw_file" accept=".bin" style="flex:1;min-width:0">
 <button class="b-test" onclick="fwUpload()">Upload</button>
 </div>
-<div class="row" style="margin-top:10px">
-<select id="fw_target" style="flex:1;min-width:0"><option value="-1">All carts</option></select>
-<button class="b-start" onclick="fwUpdate()">Update</button>
-</div>
-<div class="mode" style="margin-top:8px">Upload .pio/build/solar_planet_esp32c3/firmware.bin. Carts update one
-at a time, only while the show is idle: each stops, downloads the image from the Sun, checks it and reboots.</div>
+<div class="mode" style="margin-top:8px">Upload .pio/build/solar_planet_esp32c3/firmware.bin. While the show is
+idle, every cart running a different build downloads it from the Sun (all at once), checks it and reboots.
+A show pauses the downloads. Turn off planets &rsaquo; auto_update_firmware in Settings to hold the carts.</div>
 </div>
 
 <div class="card"><h2>Settings</h2>
@@ -193,8 +190,7 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
  const ERRTXT=['','motor disconnected','motor stuck'];let rows='';
  const cf=d.cart_fw||{};
  if(!fwBusy)$('#fw_info').textContent=cf.present?('On the Sun: build '+fwtxt(cf.stamp,1)+' · '+
-  Math.round(cf.size/1024)+' KB'+(cf.name?' · '+cf.name:'')):'No cart firmware uploaded to the Sun yet.';
- const OTATXT=['starting…','joining AP…','','rebooting…','failed'];
+  Math.round(cf.size/1024)+' KB · auto-update '+(cf.auto?'on':'OFF')):'No cart firmware uploaded to the Sun yet.';
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
   p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
@@ -206,11 +202,11 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   const temp=tc==null?'—':('<span class="'+(tc>=70?'hot':'')+'">'+tc+'&deg;C</span>');
   const fault=pl.error?('<span class="er">'+(ERRTXT[pl.error]||('err '+pl.error))+'</span>'):(pl.online?'ok':'—');
   const cfg=!pl.online?'—':(pl.cfg_ok?'ok':'<span class="er">CHECK</span>');
-  let fw='—';                                   // build, or update progress while being updated
-  if(pl.ota!=null)fw='<span class="wa">'+(pl.ota===2?pl.ota_pct+'%':OTATXT[pl.ota])+'</span>';
-  else if(pl.ota_queued)fw='<span class="wa">queued</span>';
-  else if(pl.online)fw=pl.fw?('<span class="'+(cf.present&&pl.fw===cf.stamp?'ok':'wa')+'">'+fwtxt(pl.fw)+'</span>')
-   :'<span class="wa">old</span>';
+  let fw='—';                                   // build; download progress / result while updating
+  if(pl.online)fw=pl.ota===1?'<span class="wa">&darr; '+pl.ota_pct+'%</span>'
+   :pl.ota===2?'<span class="wa">rebooting…</span>'
+   :'<span class="'+(pl.ota===3?'er':cf.present&&pl.fw===cf.stamp?'ok':'wa')+'"'+
+    (pl.ota===3?' title="update failed, error '+pl.ota_err+'"':'')+'>'+fwtxt(pl.fw)+'</span>';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
    '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fw+'</td><td>'+fault+'</td></tr>';
  });
@@ -229,12 +225,6 @@ function fwUpload(){const f=$('#fw_file').files[0];if(!f){toast('choose a .bin f
  x.onloadend=()=>{fwBusy=false;let r={};try{r=JSON.parse(x.responseText)}catch(e){}
   toast(r.ok?'uploaded':('upload failed: '+(r.error||('HTTP '+x.status))))};
  x.open('POST','/api/planet_fw');x.send(fd)}
-function fwUpdate(){const t=+$('#fw_target').value;
- if(!confirm('Update '+(t<0?'all carts':PLANETS[t])+' now? Each cart stops, downloads the image and reboots.'))return;
- fetch('/api/planet_ota',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({planet:t})})
-  .then(r=>r.json()).then(r=>toast(r.ok?'update queued':r.error)).catch(()=>toast('request failed'))}
-PLANETS.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+n;
- $('#fw_target').appendChild(o)});
 
 /* ---- settings (recursive form bound to a live cfg object) ---- */
 let cfg=null;

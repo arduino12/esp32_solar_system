@@ -11,7 +11,8 @@
 #define SOLAR_MAGIC        0x53          // 'S' — sanity marker on every packet
 #define SOLAR_MSG_CMD      'C'           // CmdMsg    (Sun  -> Planet)
 #define SOLAR_MSG_STATUS   'S'           // StatusMsg (Planet -> Sun)
-#define SOLAR_MSG_OTA      'O'           // OtaMsg    (Sun  -> Planet)
+#define SOLAR_MSG_FW_REQ   'R'           // FwReqMsg  (Planet -> Sun)
+#define SOLAR_MSG_FW_DATA  'D'           // FwDataMsg (Sun  -> Planet)
 
 #define SOLAR_PLANET_COUNT 8             // number of orbits / planet carts
 #define SOLAR_AP_SSID_DEFAULT "SolarSystem"   // planets scan for this to find the channel
@@ -74,13 +75,22 @@ struct __attribute__((packed)) CmdMsg {
   float    wheel_r_rpm;   // right wheel (inner track, slower); sign = direction
   uint8_t  light_on;      // 0/1
   uint8_t  light_brightness; // 0..100 % when light_on (perceptual; the cart applies gamma)
-  uint8_t  light_reserved[2]; // was the WS2812 G/B bytes: kept so the message size is unchanged
   uint16_t current_ma;    // TMC rms current to apply to all drivers
   uint8_t  driver_cfg;    // packed TMC params: see SOLAR_DRVCFG_* / solarPackDriverCfg()
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
+  // Cart firmware on offer (see "Cart firmware update" below). fw_stamp = 0: nothing offered now
+  // (no image, auto-update off, or the show is running) -> a cart pauses any download.
+  uint32_t fw_stamp;      // build stamp of the Sun's cart image (YYMMDDhhmm)
+  uint32_t fw_size;       // image length, bytes
+  uint8_t  fw_md5[16];    // MD5 of the image; the cart verifies it before booting into it
 };
 
-// ------------------------ Cart firmware update (OTA) ------------------------
+// ------------------------ Cart firmware update ------------------------------
+// The Sun keeps the last uploaded cart image in its own flash partition and offers it in every
+// CmdMsg. A cart whose build differs pulls the image over ESP-NOW while the show is idle: it asks
+// for bytes at an offset (FwReqMsg) and the Sun answers with up to `count` chunks (FwDataMsg).
+// The Sun keeps no per-cart state, so any number of carts download at once. No Wi-Fi join.
+//
 // Every cart build embeds the text SOLAR_FW_MARK followed by __DATE__ " " __TIME__
 // ("Oct 25 2026 14:30:05"). The cart reports that build as a YYMMDDhhmm number (2610251430);
 // the Sun finds the same text in an uploaded image, so both sides agree on which build it is.
@@ -98,31 +108,37 @@ static inline uint32_t solarFwStamp(const char *dt) { // "Mmm dd yyyy hh:mm:ss" 
   return d2(dt + 9) * 100000000u + mo * 1000000u + d2(dt + 4) * 10000u + d2(dt + 12) * 100u + d2(dt + 15);
 }
 
-// Cart OTA progress, reported in StatusMsg.ota_state.
+// Cart download progress, reported in StatusMsg.ota_state.
 enum OtaState : uint8_t {
   OTA_IDLE = 0,
-  OTA_JOINING,         // joining the Sun's AP to download
-  OTA_DOWNLOADING,     // ota_progress = 0..100 %
-  OTA_DONE,            // image written and verified; rebooting into it
-  OTA_FAILED,          // ota_err says why; the cart carries on with its current build
+  OTA_DOWNLOADING,     // ota_progress = 0..100 % (also while paused for a running show)
+  OTA_DONE,            // image written and MD5-verified; rebooting into it
+  OTA_FAILED,          // ota_err says why; the cart retries later with its current build running
 };
 
-// Sun -> Planet: fetch a new firmware image from the Sun and reboot into it. Sent only while the
-// show is idle, to one cart at a time. The carts have no Wi-Fi credentials, so the Sun's AP
-// SSID/password travel here (the AP is the Sun's own installation network).
-struct __attribute__((packed)) OtaMsg {
+#define SOLAR_FW_CHUNK 232                           // image bytes per FwDataMsg (fits 250 B)
+
+// Planet -> Sun: "send me `count` chunks of image `fw_stamp` starting at `offset`".
+struct __attribute__((packed)) FwReqMsg {
   uint8_t  magic;         // = SOLAR_MAGIC
-  uint8_t  type;          // = SOLAR_MSG_OTA
-  uint8_t  planet_index;
-  uint32_t fw_stamp;      // build on offer (YYMMDDhhmm); a cart already running it ignores this
-  char     ssid[33];
-  char     pass[65];      // "" = open AP
-  char     url[64];       // e.g. "http://192.168.4.1/planet.bin"
+  uint8_t  type;          // = SOLAR_MSG_FW_REQ
+  uint32_t fw_stamp;
+  uint32_t offset;
+  uint8_t  count;
 };
+
+// Sun -> Planet: one chunk. Sent with only `len` bytes of data (the tail of the struct is cut).
+struct __attribute__((packed)) FwDataMsg {
+  uint8_t  magic;         // = SOLAR_MAGIC
+  uint8_t  type;          // = SOLAR_MSG_FW_DATA
+  uint32_t fw_stamp;
+  uint32_t offset;
+  uint8_t  len;
+  uint8_t  data[SOLAR_FW_CHUNK];
+};
+#define SOLAR_FW_DATA_HDR (sizeof(FwDataMsg) - SOLAR_FW_CHUNK)
 
 // Planet -> Sun. Broadcast until the Sun's MAC is learned, then unicast to it.
-// The fields from fw_stamp on were added later: carts on older firmware send the message without
-// them, and the Sun accepts that (missing fields read as 0, i.e. "old build").
 struct __attribute__((packed)) StatusMsg {
   uint8_t  magic;         // = SOLAR_MAGIC
   uint8_t  type;          // = SOLAR_MSG_STATUS
@@ -137,8 +153,9 @@ struct __attribute__((packed)) StatusMsg {
   uint32_t fw_stamp;      // running build, YYMMDDhhmm (see SOLAR_FW_MARK)
   uint8_t  ota_state;     // OtaState
   uint8_t  ota_progress;  // 0..100 % while OTA_DOWNLOADING
-  int16_t  ota_err;       // why OTA_FAILED: 1 = couldn't join the AP, else HTTPUpdate's error code
+  int16_t  ota_err;       // why OTA_FAILED: an Update library error, or OTA_ERR_* below
 };
-#define SOLAR_STATUS_V1_LEN 10   // StatusMsg size before fw_stamp (older cart firmware)
+#define OTA_ERR_NO_DATA  100     // the Sun stopped answering chunk requests
+#define OTA_ERR_BEGIN    101     // couldn't open the cart's OTA partition (image too big?)
 
 #define PLANET_INDEX_UNKNOWN 0xFF

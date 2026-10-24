@@ -63,6 +63,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
   "planets": {
     "mac_address": ["","","","","","","",""],
     "light_brightness_per": [100,100,100,100,100,100,100,100],
+    "auto_update_firmware": true,
     "wheels": {
       "diameter_mm": 36,
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
@@ -101,16 +102,23 @@ struct PlanetState {
   int8_t   tempC;         // planet die temperature, °C (reported by the cart)
   int8_t   rssi;          // planet<->Sun signal, dBm (reported by the cart)
   bool     cfgOk;         // planet verified its last driver-param apply over UART
-  uint32_t fwStamp;       // running cart build, YYMMDDhhmm (0 = firmware older than OTA support)
+  uint32_t fwStamp;       // running cart build, YYMMDDhhmm
   uint8_t  otaState;      // OtaState reported by the cart
   uint8_t  otaProgress;   // 0..100 % while downloading
   int16_t  otaErr;        // reason for OTA_FAILED
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
 
-// Cart firmware image held for OTA: LittleFS /planet.bin, described by /planet_fw.json.
-struct PlanetFw { bool present; uint32_t size; uint32_t stamp; String md5; String name; };
-static PlanetFw g_fw;
+// Cart firmware image, LittleFS CART_FW_PATH (see "Cart firmware update" below), and the chunk
+// requests the ESP-NOW callback queues for loop() to answer.
+#define CART_FW_PATH "/cart.bin"
+struct CartFw { bool present; uint32_t size; uint32_t stamp; uint8_t md5[16]; };
+static CartFw g_fw = {};
+static SemaphoreHandle_t g_fwLock = nullptr;   // an upload replacing the file vs loop() reading it
+#define FW_REQQ 16
+struct FwReq { uint8_t planet; uint32_t stamp; uint32_t offset; uint8_t count; };
+static FwReq  g_fwReqq[FW_REQQ];
+static volatile uint8_t g_fwReqHead = 0, g_fwReqTail = 0;
 
 // Deferred work flags (set from async/ISR context, handled in loop()).
 static volatile bool g_reloadSettings = false;
@@ -236,6 +244,11 @@ static void migrateSettings() {
     changed = true;
     Serial.println("Migrated settings: added planets.light_brightness_per");
   }
+  if (!planets.isNull() && planets["auto_update_firmware"].isNull()) {
+    planets["auto_update_firmware"] = true;     // carts fetch the Sun's cart image by themselves
+    changed = true;
+    Serial.println("Migrated settings: added planets.auto_update_firmware");
+  }
   if (changed) saveSettings();
 }
 
@@ -284,14 +297,28 @@ static void parseMacs() {
 }
 
 // ----------------------------- ESP-NOW ---------------------------------------
-static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len < 2 || data[0] != SOLAR_MAGIC || data[1] != SOLAR_MSG_STATUS) return;
-  if (len < SOLAR_STATUS_V1_LEN) return;               // older carts send the short form
-  StatusMsg s = {}; memcpy(&s, data, min((size_t)len, sizeof(s)));
+static int planetByMac(const uint8_t *mac) {
+  for (int i = 0; i < SOLAR_PLANET_COUNT; i++)
+    if (g_macValid[i] && memcmp(mac, g_planetMac[i], 6) == 0) return i;
+  return -1;
+}
 
-  int idx = -1;
-  for (int i = 0; i < SOLAR_PLANET_COUNT; i++)         // match by MAC
-    if (g_macValid[i] && memcmp(mac, g_planetMac[i], 6) == 0) { idx = i; break; }
+static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len < 2 || data[0] != SOLAR_MAGIC) return;
+  if (data[1] == SOLAR_MSG_FW_REQ) {                   // a cart wants image bytes: loop() answers
+    int i = planetByMac(mac);
+    if (i < 0 || len < (int)sizeof(FwReqMsg)) return;
+    const FwReqMsg *r = (const FwReqMsg *)data;
+    uint8_t next = (g_fwReqHead + 1) % FW_REQQ;
+    if (next == g_fwReqTail) return;                   // full: the cart asks again
+    g_fwReqq[g_fwReqHead] = {(uint8_t)i, r->fw_stamp, r->offset, r->count};
+    g_fwReqHead = next;
+    return;
+  }
+  if (data[1] != SOLAR_MSG_STATUS || len < (int)sizeof(StatusMsg)) return;
+  StatusMsg s; memcpy(&s, data, sizeof(s));
+
+  int idx = planetByMac(mac);
   if (idx < 0 && s.planet_index < SOLAR_PLANET_COUNT)  // fall back to echoed index
     idx = s.planet_index;
   if (idx < 0) return;
@@ -349,6 +376,16 @@ static void setCmdLight(CmdMsg &m, int i) {
   m.light_brightness = (uint8_t)lroundf(constrain(pct, 0.0f, 100.0f));
 }
 
+// Offer the cart image in the command: only while IDLE with auto-update on. Otherwise fw_stamp
+// stays 0 and a cart that is downloading pauses until it is offered again.
+static void setCmdFw(CmdMsg &m) {
+  bool autoUpdate = g_settings["planets"]["auto_update_firmware"] | true;
+  if (!g_fw.present || !autoUpdate || g_mode != MODE_IDLE) return;
+  m.fw_stamp = g_fw.stamp;
+  m.fw_size  = g_fw.size;
+  memcpy(m.fw_md5, g_fw.md5, sizeof(m.fw_md5));
+}
+
 // Given the per-rail OUTER wheel speed, compute the two wheel speeds so the cart rolls around the
 // ring, and the resulting orbital speed for the web animation. log_scale_speed_rpm is the OUTER
 // (faster) wheel; the inner rail is smaller by 2*width_mm, so the inner wheel turns proportionally
@@ -379,6 +416,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
   setCmdLight(m, i);
+  setCmdFw(m);
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
@@ -392,6 +430,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
   setCmdLight(m, i);
+  setCmdFw(m);
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl);
@@ -538,159 +577,145 @@ static void serviceStateMachine() {
 }
 
 // ----------------------------- Cart firmware update ---------------------------
-// The web page uploads a cart image to LittleFS; the Sun then asks the carts, one at a time and
-// only while IDLE, to download it from http://<AP IP>/planet.bin and reboot into it (OtaMsg).
-// A cart counts as updated once it reports the image's build stamp.
-#define OTA_ACK_MS 15000            // the cart must start (join/download) within this
-#define OTA_MAX_MS 180000           // whole update, reboot included
+// The last uploaded cart image is the LittleFS file CART_FW_PATH. While IDLE (and auto-update is
+// on) every CmdMsg offers it; a cart whose build differs pulls it over ESP-NOW with FwReqMsg and
+// the Sun answers each request with FwDataMsg chunks read from the file. Nothing per cart is kept
+// here, so any number of carts download at once. The ESP-NOW callback only queues the requests;
+// loop() reads the file and sends the chunks.
+static String   g_upErr;                    // why the last upload was rejected ("" = accepted)
+static File     g_upFile;
+static volatile bool g_fwUploaded = false;  // an upload finished: log it from loop()
 
-static uint8_t  g_otaQueue = 0;     // planets waiting for an update (bitmask)
-static int8_t   g_otaCur   = -1;    // planet being updated now
-static uint32_t g_otaStartMs = 0, g_otaSendMs = 0;
-static bool     g_otaBusySeen = false;      // the cart acknowledged (joining/downloading/done)
-static volatile int  g_otaRequest = -2;     // from the web handler: -1 = all carts, 0..7 = one
-static volatile bool g_fwUploaded = false;  // upload finished (log it from loop())
+// Inspect CART_FW_PATH: it must be one complete ESP32-C3 app image (header + segments + checksum
+// padding + optional SHA-256 add up to the file size) carrying the SOLAR_FW_MARK build stamp.
+// Sets g_fw (size, MD5, stamp); g_fw.present stays false for anything else.
+static void loadCartFw() {
+  CartFw fw = {};
+  File f = LittleFS.open(CART_FW_PATH, "r");
+  if (!f) { g_fw = fw; return; }
+  uint32_t size = f.size();
+  uint8_t h[24];
+  bool ok = f.read(h, sizeof(h)) == sizeof(h) && h[0] == 0xE9 && (h[12] | (h[13] << 8)) == 5;
+  uint32_t pos = sizeof(h);
+  for (uint8_t s = 0; ok && s < h[1]; s++) {          // segment: load address, length, data
+    uint32_t seg[2];
+    ok = f.seek(pos) && f.read((uint8_t *)seg, sizeof(seg)) == sizeof(seg) && seg[1] < size;
+    pos += sizeof(seg) + seg[1];
+    ok = ok && pos < size;
+  }
+  pos = (pos | 15) + 1;                                // padded to 16, checksum as the last byte
+  if (h[23]) pos += 32;                                // SHA-256 appended
+  ok = ok && pos == size;
 
-static void loadPlanetFw() {
-  g_fw = PlanetFw();
-  if (!LittleFS.exists("/planet.bin")) return;
-  File f = LittleFS.open("/planet_fw.json", "r");
-  JsonDocument d;
-  if (!f || deserializeJson(d, f)) return;
-  g_fw.size  = d["size"]  | 0;
-  g_fw.stamp = d["stamp"] | 0;
-  g_fw.md5   = (const char *)(d["md5"]  | "");
-  g_fw.name  = (const char *)(d["name"] | "");
-  g_fw.present = g_fw.stamp && g_fw.md5.length() == 32;
+  static const char MK[] = SOLAR_FW_MARK;
+  static uint8_t buf[2048];
+  char cap[SOLAR_FW_STAMP_LEN + 1];
+  uint8_t mk = 0, capLen = 0;
+  bool capturing = false;
+  MD5Builder md5;
+  md5.begin();
+  f.seek(0);
+  int n;
+  while (ok && (n = f.read(buf, sizeof(buf))) > 0) {
+    md5.add(buf, n);
+    for (int k = 0; k < n && !fw.stamp; k++) {         // find the marker, then read the stamp
+      char c = (char)buf[k];
+      if (capturing) {
+        cap[capLen++] = c;
+        if (capLen == SOLAR_FW_STAMP_LEN) { cap[capLen] = 0; fw.stamp = solarFwStamp(cap); }
+      } else if (c == MK[mk]) {
+        if (++mk == sizeof(MK) - 1) { capturing = true; capLen = 0; }
+      } else {
+        mk = (c == MK[0]) ? 1 : 0;                     // the marker has no repeated prefix
+      }
+    }
+  }
+  f.close();
+  md5.calculate();
+  md5.getBytes(fw.md5);
+  fw.size = size;
+  fw.present = ok && fw.stamp;
+  g_fw = fw;
 }
 
-static void savePlanetFw() {
-  JsonDocument d;
-  d["size"] = g_fw.size; d["stamp"] = g_fw.stamp; d["md5"] = g_fw.md5; d["name"] = g_fw.name;
-  File f = LittleFS.open("/planet_fw.json", "w");
-  if (f) { serializeJson(d, f); f.close(); }
-}
-
-// Upload body handler (async_tcp task). The image is checked as it streams in: an ESP32-C3 app
-// (magic 0xE9, chip id 5) carrying the SOLAR_FW_MARK build stamp, with an MD5 for the carts.
-static File       g_upFile;
-static MD5Builder g_upMd5;
-static String     g_upErr;
-static uint32_t   g_upSize = 0, g_upStamp = 0;
-static uint8_t    g_upMkPos = 0, g_upCapLen = 0;
-static bool       g_upCapturing = false;
-static char       g_upCap[SOLAR_FW_STAMP_LEN + 1];
-
+// Upload body handler (async_tcp task): the image streams straight into CART_FW_PATH. The flash
+// holds one image, so the old one is deleted first (under g_fwLock: loop() may be reading it).
 static void fwUploadChunk(AsyncWebServerRequest *req, const String &name, size_t index,
                           uint8_t *data, size_t len, bool final) {
-  static const char MK[] = SOLAR_FW_MARK;
   if (index == 0) {
-    g_upErr = ""; g_upSize = 0; g_upStamp = 0; g_upMkPos = 0; g_upCapLen = 0; g_upCapturing = false;
-    if (g_otaCur >= 0 || g_otaQueue)                      g_upErr = "a cart update is running";
-    else if (len < 16 || data[0] != 0xE9 || (data[12] | (data[13] << 8)) != 5)
-                                                          g_upErr = "not an ESP32-C3 firmware image";
-    if (g_upErr.length()) return;
-    g_fw.present = false;                                 // make room: ~1 MB, flash holds one image
-    LittleFS.remove("/planet.bin"); LittleFS.remove("/planet_fw.json");
-    g_upFile = LittleFS.open("/planet.tmp", "w");
+    g_upErr = "";
+    if (len < 24 || data[0] != 0xE9 || (data[12] | (data[13] << 8)) != 5) {
+      g_upErr = "not an ESP32-C3 firmware image";
+      return;
+    }
+    xSemaphoreTake(g_fwLock, portMAX_DELAY);
+    g_fw.present = false;                              // stop offering / serving the old image
+    LittleFS.remove(CART_FW_PATH);
+    g_upFile = LittleFS.open(CART_FW_PATH, "w");
+    xSemaphoreGive(g_fwLock);
     if (!g_upFile) { g_upErr = "cannot write to the Sun's flash"; return; }
-    g_upMd5.begin();
   }
-  if (g_upErr.length() || !g_upFile) return;
+  if (!g_upErr.isEmpty() || !g_upFile) return;
   if (g_upFile.write(data, len) != len) {
     g_upErr = "image does not fit in the Sun's flash";
-    g_upFile.close(); LittleFS.remove("/planet.tmp");
+    g_upFile.close();
+    LittleFS.remove(CART_FW_PATH);
     return;
-  }
-  g_upMd5.add(data, len);
-  g_upSize += len;
-  for (size_t k = 0; k < len && !g_upStamp; k++) {      // find the marker, then read the stamp
-    char c = (char)data[k];
-    if (g_upCapturing) {
-      g_upCap[g_upCapLen++] = c;
-      if (g_upCapLen == SOLAR_FW_STAMP_LEN) { g_upCap[g_upCapLen] = 0; g_upStamp = solarFwStamp(g_upCap); }
-    } else if (c == MK[g_upMkPos]) {
-      if (++g_upMkPos == sizeof(MK) - 1) { g_upCapturing = true; g_upCapLen = 0; }
-    } else {
-      g_upMkPos = (c == MK[0]) ? 1 : 0;                   // the marker has no repeated prefix
-    }
   }
   if (!final) return;
   g_upFile.close();
-  if (!g_upStamp) {
-    g_upErr = "not a Solar System cart build (no build stamp)";
-    LittleFS.remove("/planet.tmp");
-    return;
-  }
-  g_upMd5.calculate();
-  LittleFS.rename("/planet.tmp", "/planet.bin");
-  g_fw.size = g_upSize; g_fw.stamp = g_upStamp; g_fw.md5 = g_upMd5.toString(); g_fw.name = name;
-  g_fw.present = true;
-  savePlanetFw();
+  loadCartFw();
+  if (!g_fw.present) g_upErr = "not a complete Solar System cart build";
   g_fwUploaded = true;
 }
 
-static void sendOta(int i) {
-  OtaMsg m = {};
-  m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_OTA; m.planet_index = i;
-  m.fw_stamp = g_fw.stamp;
-  String ssid = g_settings["wifi"]["ap_ssid"] | SOLAR_AP_SSID_DEFAULT;
-  String pass = g_settings["wifi"]["ap_pass"] | "didivardi";
-  if (pass.length() < 8) pass = "";                       // wifiStart() runs the AP open then
-  strlcpy(m.ssid, ssid.c_str(), sizeof(m.ssid));
-  strlcpy(m.pass, pass.c_str(), sizeof(m.pass));
-  snprintf(m.url, sizeof(m.url), "http://%s/planet.bin", WiFi.softAPIP().toString().c_str());
-  esp_now_send(g_planetMac[i], (const uint8_t *)&m, sizeof(m));
-  g_otaSendMs = millis();
+// Answer queued chunk requests from the image file (at most 8 chunks per request).
+static void serviceFwRequests() {
+  if (g_fwReqTail == g_fwReqHead) return;
+  if (xSemaphoreTake(g_fwLock, 0) != pdTRUE) return;   // an upload is replacing the image
+  File f = g_fw.present ? LittleFS.open(CART_FW_PATH, "r") : File();
+  static FwDataMsg d;
+  while (g_fwReqTail != g_fwReqHead) {
+    FwReq r = g_fwReqq[g_fwReqTail];
+    g_fwReqTail = (g_fwReqTail + 1) % FW_REQQ;
+    if (!f || r.stamp != g_fw.stamp) continue;         // stale: the cart follows the offer instead
+    uint32_t off = r.offset;
+    for (uint8_t k = 0; k < r.count && k < 8 && off < g_fw.size; k++) {
+      uint8_t n = (uint8_t)min((uint32_t)SOLAR_FW_CHUNK, g_fw.size - off);
+      d.magic = SOLAR_MAGIC; d.type = SOLAR_MSG_FW_DATA;
+      d.fw_stamp = g_fw.stamp; d.offset = off; d.len = n;
+      if (!f.seek(off) || f.read(d.data, n) != n) break;
+      if (esp_now_send(g_planetMac[r.planet], (const uint8_t *)&d, SOLAR_FW_DATA_HDR + n) != ESP_OK) break;
+      off += n;
+    }
+  }
+  if (f) f.close();
+  xSemaphoreGive(g_fwLock);
 }
 
-static void otaFinish(int i, const String &msg) {
-  addLog("Planet " + String(i) + ": " + msg);
-  g_otaCur = -1;
-}
-
-static void serviceOta() {
+// Uploads and each cart's download progress, for the web log.
+static void serviceCartFw() {
   if (g_fwUploaded) {
     g_fwUploaded = false;
-    addLog("Cart firmware uploaded (build " + String(g_fw.stamp) + ", " + String(g_fw.size / 1024) + " KB)");
+    addLog(g_fw.present ? "Cart firmware uploaded: build " + String(g_fw.stamp) + " (" +
+                          String(g_fw.size / 1024) + " KB)"
+                        : "Cart firmware upload rejected: " + g_upErr);
   }
-  if (g_otaRequest != -2) {
-    int r = g_otaRequest; g_otaRequest = -2;
-    for (int i = 0; i < SOLAR_PLANET_COUNT; i++)
-      if ((r < 0 || r == i) && g_macValid[i]) g_otaQueue |= (1 << i);
-  }
-  uint32_t now = millis();
-  if (g_otaCur < 0) {
-    if (!g_otaQueue) return;
-    if (g_mode != MODE_IDLE || !g_fw.present) { g_otaQueue = 0; addLog("Cart updates cancelled"); return; }
-    int i = __builtin_ctz(g_otaQueue);
-    g_otaQueue &= ~(1 << i);
+  serviceFwRequests();
+  static uint8_t  lastState[SOLAR_PLANET_COUNT];
+  static uint32_t lastStamp[SOLAR_PLANET_COUNT];
+  for (int i = 0; i < SOLAR_PLANET_COUNT; i++) {
     PlanetState &p = g_planet[i];
-    bool online = p.lastSeenMs && now - p.lastSeenMs < 5000;
-    if (!online)                  { addLog("Planet " + String(i) + ": offline, update skipped"); return; }
-    if (p.fwStamp == g_fw.stamp)  { addLog("Planet " + String(i) + ": already up to date"); return; }
-    if (p.fwStamp == 0)           { addLog("Planet " + String(i) + ": firmware predates OTA, flash it over USB once"); return; }
-    g_otaCur = i; g_otaStartMs = now; g_otaBusySeen = false;
-    addLog("Planet " + String(i) + ": updating to build " + String(g_fw.stamp));
-    sendOta(i);
-    return;
-  }
-  int i = g_otaCur;
-  PlanetState &p = g_planet[i];
-  bool fresh = (int32_t)(p.lastSeenMs - g_otaStartMs) > 0;     // status heard since we asked
-  if (fresh && p.fwStamp == g_fw.stamp) { otaFinish(i, "updated to build " + String(g_fw.stamp)); return; }
-  if (fresh && (p.otaState == OTA_JOINING || p.otaState == OTA_DOWNLOADING || p.otaState == OTA_DONE))
-    g_otaBusySeen = true;
-  if (fresh && g_otaBusySeen && p.otaState == OTA_FAILED) {
-    otaFinish(i, p.otaErr == 1 ? String("update failed: could not join the AP")
-                               : "update failed (error " + String(p.otaErr) + ")");
-    return;
-  }
-  if (!g_otaBusySeen) {
-    if (now - g_otaStartMs > OTA_ACK_MS) { otaFinish(i, "no answer to the update request"); return; }
-    if (now - g_otaSendMs > 2000) sendOta(i);                  // the request may have been lost
-  } else if (now - g_otaStartMs > OTA_MAX_MS) {
-    otaFinish(i, "update timed out");
+    if (!g_macValid[i] || !p.lastSeenMs || millis() - p.lastSeenMs > 5000) continue;
+    if (p.otaState != lastState[i]) {
+      if (p.otaState == OTA_DOWNLOADING) addLog("Planet " + String(i) + ": downloading the new cart build");
+      if (p.otaState == OTA_FAILED)      addLog("Planet " + String(i) + ": update failed (error " + String(p.otaErr) + "), retrying in 1 min");
+      lastState[i] = p.otaState;
+    }
+    if (p.fwStamp != lastStamp[i]) {
+      if (lastStamp[i]) addLog("Planet " + String(i) + ": now runs build " + String(p.fwStamp));
+      lastStamp[i] = p.fwStamp;
+    }
   }
 }
 
@@ -815,19 +840,16 @@ static void buildStatusJson(String &out) {
       o["rssi_pct"] = r ? constrain(2 * (r + 100), 0, 100) : 0;   // -100dBm=0%, -50dBm=100%
       o["cfg_ok"]   = g_planet[i].cfgOk;
       o["fw"]       = g_planet[i].fwStamp;
+      o["ota"]      = g_planet[i].otaState;      // OtaState: download progress / result
+      o["ota_pct"]  = g_planet[i].otaProgress;
+      o["ota_err"]  = g_planet[i].otaErr;
     }
-    if (i == g_otaCur) {                 // cart being updated: its progress
-      o["ota"]     = g_planet[i].otaState;
-      o["ota_pct"] = g_planet[i].otaProgress;
-    }
-    o["ota_queued"] = (g_otaQueue >> i) & 1;
   }
 
   JsonObject fw = d["cart_fw"].to<JsonObject>();
   fw["present"] = g_fw.present;
-  if (g_fw.present) {
-    fw["stamp"] = g_fw.stamp; fw["size"] = g_fw.size; fw["md5"] = g_fw.md5; fw["name"] = g_fw.name;
-  }
+  fw["auto"]    = g_settings["planets"]["auto_update_firmware"] | true;
+  if (g_fw.present) { fw["stamp"] = g_fw.stamp; fw["size"] = g_fw.size; }
 
   JsonObject net = d["net"].to<JsonObject>();
   net["ap_ip"]  = WiFi.softAPIP().toString();
@@ -893,7 +915,7 @@ static void setupWeb() {
       });
   server.addHandler(controlPost);
 
-  // Cart firmware: upload (multipart .bin), the image the carts download, and the update request.
+  // Cart firmware upload (multipart .bin); the carts then fetch it over ESP-NOW by themselves.
   server.on("/api/planet_fw", HTTP_POST, [](AsyncWebServerRequest *req) {
     JsonDocument d;
     d["ok"] = g_upErr.isEmpty() && g_fw.present;
@@ -902,25 +924,6 @@ static void setupWeb() {
     String s; serializeJson(d, s);
     req->send(200, "application/json", s);
   }, fwUploadChunk);
-
-  server.on("/planet.bin", HTTP_GET, [](AsyncWebServerRequest *req) {
-    if (!g_fw.present) { req->send(404, "text/plain", "no cart firmware"); return; }
-    AsyncWebServerResponse *r = req->beginResponse(LittleFS, "/planet.bin", "application/octet-stream");
-    r->addHeader("x-MD5", g_fw.md5);                 // HTTPUpdate on the cart verifies the image
-    req->send(r);
-  });
-
-  // POST /api/planet_ota {"planet": 0..7 | -1 = all}; queued, run one cart at a time in loop().
-  auto *otaPost = new AsyncCallbackJsonWebHandler(
-      "/api/planet_ota", [](AsyncWebServerRequest *req, JsonVariant &json) {
-        const char *err = !g_fw.present        ? "upload a cart firmware first"
-                        : g_mode != MODE_IDLE  ? "stop the show first (updates run only while IDLE)"
-                        : nullptr;
-        if (err) { req->send(409, "application/json", String("{\"ok\":false,\"error\":\"") + err + "\"}"); return; }
-        g_otaRequest = json["planet"] | -1;
-        req->send(200, "application/json", "{\"ok\":true}");
-      });
-  server.addHandler(otaPost);
 
   ElegantOTA.begin(&server);
   server.begin();
@@ -971,11 +974,14 @@ void setup() {
   migrateSettings();
   loadStats();
   parseMacs();
-  loadPlanetFw();
+  g_fwLock = xSemaphoreCreateMutex();
+  loadCartFw();
 
   Serial.println("\n==== Solar System — SUN boot ====");
   dumpFileToSerial("/settings.json");
   dumpFileToSerial("/stats.json");
+  if (g_fw.present) Serial.printf("Cart firmware: build %lu, %lu bytes\n", (unsigned long)g_fw.stamp, (unsigned long)g_fw.size);
+  else              Serial.println("Cart firmware: none uploaded");
 
   FastLED.addLeds<LED_TYPE, PIN_LED, LED_ORDER>(g_leds, NUM_LEDS);
   FastLED.setBrightness(0);
@@ -1006,7 +1012,7 @@ void loop() {
   serviceLeds();
   wifiLogEvents();
   wifiRetry();
-  serviceOta();
+  serviceCartFw();
   ElegantOTA.loop();
 
   if (g_reloadSettings) { g_reloadSettings = false; applyPendingSettings(); }
