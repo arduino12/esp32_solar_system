@@ -18,6 +18,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 #include <ElegantOTA.h>
+#include <MD5Builder.h>
 
 #define FASTLED_INTERNAL
 #include <FastLED.h>
@@ -100,8 +101,16 @@ struct PlanetState {
   int8_t   tempC;         // planet die temperature, °C (reported by the cart)
   int8_t   rssi;          // planet<->Sun signal, dBm (reported by the cart)
   bool     cfgOk;         // planet verified its last driver-param apply over UART
+  uint32_t fwStamp;       // running cart build, YYMMDDhhmm (0 = firmware older than OTA support)
+  uint8_t  otaState;      // OtaState reported by the cart
+  uint8_t  otaProgress;   // 0..100 % while downloading
+  int16_t  otaErr;        // reason for OTA_FAILED
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
+
+// Cart firmware image held for OTA: LittleFS /planet.bin, described by /planet_fw.json.
+struct PlanetFw { bool present; uint32_t size; uint32_t stamp; String md5; String name; };
+static PlanetFw g_fw;
 
 // Deferred work flags (set from async/ISR context, handled in loop()).
 static volatile bool g_reloadSettings = false;
@@ -277,8 +286,8 @@ static void parseMacs() {
 // ----------------------------- ESP-NOW ---------------------------------------
 static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len < 2 || data[0] != SOLAR_MAGIC || data[1] != SOLAR_MSG_STATUS) return;
-  if (len < (int)sizeof(StatusMsg)) return;
-  StatusMsg s; memcpy(&s, data, sizeof(s));
+  if (len < SOLAR_STATUS_V1_LEN) return;               // older carts send the short form
+  StatusMsg s = {}; memcpy(&s, data, min((size_t)len, sizeof(s)));
 
   int idx = -1;
   for (int i = 0; i < SOLAR_PLANET_COUNT; i++)         // match by MAC
@@ -298,6 +307,10 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   p.cfgOk      = s.cfg_ok;
   if (s.home_pulsed) p.homeCount++;
   p.error = s.error;                    // always ERR_NONE now (fault sensing removed)
+  p.fwStamp     = s.fw_stamp;
+  p.otaState    = s.ota_state;
+  p.otaProgress = s.ota_progress;
+  p.otaErr      = s.ota_err;
 }
 
 static void addPeer(const uint8_t *mac) {
@@ -524,6 +537,163 @@ static void serviceStateMachine() {
     broadcastModeCmd(false);
 }
 
+// ----------------------------- Cart firmware update ---------------------------
+// The web page uploads a cart image to LittleFS; the Sun then asks the carts, one at a time and
+// only while IDLE, to download it from http://<AP IP>/planet.bin and reboot into it (OtaMsg).
+// A cart counts as updated once it reports the image's build stamp.
+#define OTA_ACK_MS 15000            // the cart must start (join/download) within this
+#define OTA_MAX_MS 180000           // whole update, reboot included
+
+static uint8_t  g_otaQueue = 0;     // planets waiting for an update (bitmask)
+static int8_t   g_otaCur   = -1;    // planet being updated now
+static uint32_t g_otaStartMs = 0, g_otaSendMs = 0;
+static bool     g_otaBusySeen = false;      // the cart acknowledged (joining/downloading/done)
+static volatile int  g_otaRequest = -2;     // from the web handler: -1 = all carts, 0..7 = one
+static volatile bool g_fwUploaded = false;  // upload finished (log it from loop())
+
+static void loadPlanetFw() {
+  g_fw = PlanetFw();
+  if (!LittleFS.exists("/planet.bin")) return;
+  File f = LittleFS.open("/planet_fw.json", "r");
+  JsonDocument d;
+  if (!f || deserializeJson(d, f)) return;
+  g_fw.size  = d["size"]  | 0;
+  g_fw.stamp = d["stamp"] | 0;
+  g_fw.md5   = (const char *)(d["md5"]  | "");
+  g_fw.name  = (const char *)(d["name"] | "");
+  g_fw.present = g_fw.stamp && g_fw.md5.length() == 32;
+}
+
+static void savePlanetFw() {
+  JsonDocument d;
+  d["size"] = g_fw.size; d["stamp"] = g_fw.stamp; d["md5"] = g_fw.md5; d["name"] = g_fw.name;
+  File f = LittleFS.open("/planet_fw.json", "w");
+  if (f) { serializeJson(d, f); f.close(); }
+}
+
+// Upload body handler (async_tcp task). The image is checked as it streams in: an ESP32-C3 app
+// (magic 0xE9, chip id 5) carrying the SOLAR_FW_MARK build stamp, with an MD5 for the carts.
+static File       g_upFile;
+static MD5Builder g_upMd5;
+static String     g_upErr;
+static uint32_t   g_upSize = 0, g_upStamp = 0;
+static uint8_t    g_upMkPos = 0, g_upCapLen = 0;
+static bool       g_upCapturing = false;
+static char       g_upCap[SOLAR_FW_STAMP_LEN + 1];
+
+static void fwUploadChunk(AsyncWebServerRequest *req, const String &name, size_t index,
+                          uint8_t *data, size_t len, bool final) {
+  static const char MK[] = SOLAR_FW_MARK;
+  if (index == 0) {
+    g_upErr = ""; g_upSize = 0; g_upStamp = 0; g_upMkPos = 0; g_upCapLen = 0; g_upCapturing = false;
+    if (g_otaCur >= 0 || g_otaQueue)                      g_upErr = "a cart update is running";
+    else if (len < 16 || data[0] != 0xE9 || (data[12] | (data[13] << 8)) != 5)
+                                                          g_upErr = "not an ESP32-C3 firmware image";
+    if (g_upErr.length()) return;
+    g_fw.present = false;                                 // make room: ~1 MB, flash holds one image
+    LittleFS.remove("/planet.bin"); LittleFS.remove("/planet_fw.json");
+    g_upFile = LittleFS.open("/planet.tmp", "w");
+    if (!g_upFile) { g_upErr = "cannot write to the Sun's flash"; return; }
+    g_upMd5.begin();
+  }
+  if (g_upErr.length() || !g_upFile) return;
+  if (g_upFile.write(data, len) != len) {
+    g_upErr = "image does not fit in the Sun's flash";
+    g_upFile.close(); LittleFS.remove("/planet.tmp");
+    return;
+  }
+  g_upMd5.add(data, len);
+  g_upSize += len;
+  for (size_t k = 0; k < len && !g_upStamp; k++) {      // find the marker, then read the stamp
+    char c = (char)data[k];
+    if (g_upCapturing) {
+      g_upCap[g_upCapLen++] = c;
+      if (g_upCapLen == SOLAR_FW_STAMP_LEN) { g_upCap[g_upCapLen] = 0; g_upStamp = solarFwStamp(g_upCap); }
+    } else if (c == MK[g_upMkPos]) {
+      if (++g_upMkPos == sizeof(MK) - 1) { g_upCapturing = true; g_upCapLen = 0; }
+    } else {
+      g_upMkPos = (c == MK[0]) ? 1 : 0;                   // the marker has no repeated prefix
+    }
+  }
+  if (!final) return;
+  g_upFile.close();
+  if (!g_upStamp) {
+    g_upErr = "not a Solar System cart build (no build stamp)";
+    LittleFS.remove("/planet.tmp");
+    return;
+  }
+  g_upMd5.calculate();
+  LittleFS.rename("/planet.tmp", "/planet.bin");
+  g_fw.size = g_upSize; g_fw.stamp = g_upStamp; g_fw.md5 = g_upMd5.toString(); g_fw.name = name;
+  g_fw.present = true;
+  savePlanetFw();
+  g_fwUploaded = true;
+}
+
+static void sendOta(int i) {
+  OtaMsg m = {};
+  m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_OTA; m.planet_index = i;
+  m.fw_stamp = g_fw.stamp;
+  String ssid = g_settings["wifi"]["ap_ssid"] | SOLAR_AP_SSID_DEFAULT;
+  String pass = g_settings["wifi"]["ap_pass"] | "didivardi";
+  if (pass.length() < 8) pass = "";                       // wifiStart() runs the AP open then
+  strlcpy(m.ssid, ssid.c_str(), sizeof(m.ssid));
+  strlcpy(m.pass, pass.c_str(), sizeof(m.pass));
+  snprintf(m.url, sizeof(m.url), "http://%s/planet.bin", WiFi.softAPIP().toString().c_str());
+  esp_now_send(g_planetMac[i], (const uint8_t *)&m, sizeof(m));
+  g_otaSendMs = millis();
+}
+
+static void otaFinish(int i, const String &msg) {
+  addLog("Planet " + String(i) + ": " + msg);
+  g_otaCur = -1;
+}
+
+static void serviceOta() {
+  if (g_fwUploaded) {
+    g_fwUploaded = false;
+    addLog("Cart firmware uploaded (build " + String(g_fw.stamp) + ", " + String(g_fw.size / 1024) + " KB)");
+  }
+  if (g_otaRequest != -2) {
+    int r = g_otaRequest; g_otaRequest = -2;
+    for (int i = 0; i < SOLAR_PLANET_COUNT; i++)
+      if ((r < 0 || r == i) && g_macValid[i]) g_otaQueue |= (1 << i);
+  }
+  uint32_t now = millis();
+  if (g_otaCur < 0) {
+    if (!g_otaQueue) return;
+    if (g_mode != MODE_IDLE || !g_fw.present) { g_otaQueue = 0; addLog("Cart updates cancelled"); return; }
+    int i = __builtin_ctz(g_otaQueue);
+    g_otaQueue &= ~(1 << i);
+    PlanetState &p = g_planet[i];
+    bool online = p.lastSeenMs && now - p.lastSeenMs < 5000;
+    if (!online)                  { addLog("Planet " + String(i) + ": offline, update skipped"); return; }
+    if (p.fwStamp == g_fw.stamp)  { addLog("Planet " + String(i) + ": already up to date"); return; }
+    if (p.fwStamp == 0)           { addLog("Planet " + String(i) + ": firmware predates OTA, flash it over USB once"); return; }
+    g_otaCur = i; g_otaStartMs = now; g_otaBusySeen = false;
+    addLog("Planet " + String(i) + ": updating to build " + String(g_fw.stamp));
+    sendOta(i);
+    return;
+  }
+  int i = g_otaCur;
+  PlanetState &p = g_planet[i];
+  bool fresh = (int32_t)(p.lastSeenMs - g_otaStartMs) > 0;     // status heard since we asked
+  if (fresh && p.fwStamp == g_fw.stamp) { otaFinish(i, "updated to build " + String(g_fw.stamp)); return; }
+  if (fresh && (p.otaState == OTA_JOINING || p.otaState == OTA_DOWNLOADING || p.otaState == OTA_DONE))
+    g_otaBusySeen = true;
+  if (fresh && g_otaBusySeen && p.otaState == OTA_FAILED) {
+    otaFinish(i, p.otaErr == 1 ? String("update failed: could not join the AP")
+                               : "update failed (error " + String(p.otaErr) + ")");
+    return;
+  }
+  if (!g_otaBusySeen) {
+    if (now - g_otaStartMs > OTA_ACK_MS) { otaFinish(i, "no answer to the update request"); return; }
+    if (now - g_otaSendMs > 2000) sendOta(i);                  // the request may have been lost
+  } else if (now - g_otaStartMs > OTA_MAX_MS) {
+    otaFinish(i, "update timed out");
+  }
+}
+
 // ----------------------------- Buttons ---------------------------------------
 static void onStartButton() {
   if (g_mode == MODE_IDLE || g_mode == MODE_MENORAH) {
@@ -644,7 +814,19 @@ static void buildStatusJson(String &out) {
       o["rssi"]     = r;
       o["rssi_pct"] = r ? constrain(2 * (r + 100), 0, 100) : 0;   // -100dBm=0%, -50dBm=100%
       o["cfg_ok"]   = g_planet[i].cfgOk;
+      o["fw"]       = g_planet[i].fwStamp;
     }
+    if (i == g_otaCur) {                 // cart being updated: its progress
+      o["ota"]     = g_planet[i].otaState;
+      o["ota_pct"] = g_planet[i].otaProgress;
+    }
+    o["ota_queued"] = (g_otaQueue >> i) & 1;
+  }
+
+  JsonObject fw = d["cart_fw"].to<JsonObject>();
+  fw["present"] = g_fw.present;
+  if (g_fw.present) {
+    fw["stamp"] = g_fw.stamp; fw["size"] = g_fw.size; fw["md5"] = g_fw.md5; fw["name"] = g_fw.name;
   }
 
   JsonObject net = d["net"].to<JsonObject>();
@@ -711,6 +893,35 @@ static void setupWeb() {
       });
   server.addHandler(controlPost);
 
+  // Cart firmware: upload (multipart .bin), the image the carts download, and the update request.
+  server.on("/api/planet_fw", HTTP_POST, [](AsyncWebServerRequest *req) {
+    JsonDocument d;
+    d["ok"] = g_upErr.isEmpty() && g_fw.present;
+    if (!g_upErr.isEmpty()) d["error"] = g_upErr;
+    else if (g_fw.present) d["stamp"] = g_fw.stamp;
+    String s; serializeJson(d, s);
+    req->send(200, "application/json", s);
+  }, fwUploadChunk);
+
+  server.on("/planet.bin", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (!g_fw.present) { req->send(404, "text/plain", "no cart firmware"); return; }
+    AsyncWebServerResponse *r = req->beginResponse(LittleFS, "/planet.bin", "application/octet-stream");
+    r->addHeader("x-MD5", g_fw.md5);                 // HTTPUpdate on the cart verifies the image
+    req->send(r);
+  });
+
+  // POST /api/planet_ota {"planet": 0..7 | -1 = all}; queued, run one cart at a time in loop().
+  auto *otaPost = new AsyncCallbackJsonWebHandler(
+      "/api/planet_ota", [](AsyncWebServerRequest *req, JsonVariant &json) {
+        const char *err = !g_fw.present        ? "upload a cart firmware first"
+                        : g_mode != MODE_IDLE  ? "stop the show first (updates run only while IDLE)"
+                        : nullptr;
+        if (err) { req->send(409, "application/json", String("{\"ok\":false,\"error\":\"") + err + "\"}"); return; }
+        g_otaRequest = json["planet"] | -1;
+        req->send(200, "application/json", "{\"ok\":true}");
+      });
+  server.addHandler(otaPost);
+
   ElegantOTA.begin(&server);
   server.begin();
 }
@@ -760,6 +971,7 @@ void setup() {
   migrateSettings();
   loadStats();
   parseMacs();
+  loadPlanetFw();
 
   Serial.println("\n==== Solar System — SUN boot ====");
   dumpFileToSerial("/settings.json");
@@ -794,6 +1006,7 @@ void loop() {
   serviceLeds();
   wifiLogEvents();
   wifiRetry();
+  serviceOta();
   ElegantOTA.loop();
 
   if (g_reloadSettings) { g_reloadSettings = false; applyPendingSettings(); }

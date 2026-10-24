@@ -32,8 +32,13 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <HTTPUpdate.h>
 #include <TMCStepper.h>
 #include "solar_protocol.h"
+
+// Build identity: the Sun reads this marker out of an uploaded image (see SOLAR_FW_MARK).
+static const char FW_ID[] = SOLAR_FW_MARK __DATE__ " " __TIME__;
+static const uint32_t g_fwStamp = solarFwStamp(FW_ID + sizeof(SOLAR_FW_MARK) - 1);
 
 // ----------------------------- Pin map (from spec) --------------------------
 static const uint8_t PIN_TMC_EN     = 2;   // TMC enable, active-low (LOW = drivers on)
@@ -152,6 +157,15 @@ static const uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 // Self-test (button in OFFLINE): spin + light for a fixed window.
 static bool     g_selfTest    = false;
 static uint32_t g_selfTestEndMs = 0;
+
+// Firmware update from the Sun (OtaMsg). The request is copied in the recv callback and run from
+// loop(); its state rides along in every StatusMsg.
+static volatile bool g_otaPending = false;
+static OtaMsg   g_rxOta;
+static uint8_t  g_otaState    = OTA_IDLE;
+static uint8_t  g_otaProgress = 0;
+static int16_t  g_otaErr      = 0;
+static uint8_t  g_sunChannel  = 0;          // Wi-Fi channel the Sun was found on
 
 // ----------------------------- HOME ISR -------------------------------------
 void IRAM_ATTR homeIsr() {
@@ -424,8 +438,15 @@ static volatile bool g_cmdPending = false;
 static CmdMsg        g_rxCmd;
 
 static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len < 2 || data[0] != SOLAR_MAGIC || data[1] != SOLAR_MSG_CMD) return;
-  if (len < (int)sizeof(CmdMsg)) return;
+  if (len < 2 || data[0] != SOLAR_MAGIC) return;
+  if (data[1] == SOLAR_MSG_OTA) {   // firmware update: only from the Sun this cart already follows
+    if (len < (int)sizeof(OtaMsg) || !g_sunKnown || memcmp(mac, g_sunMac, 6) != 0) return;
+    if (g_otaPending) return;       // loop() is still reading the previous request
+    memcpy(&g_rxOta, data, sizeof(OtaMsg));
+    g_otaPending = true;
+    return;
+  }
+  if (data[1] != SOLAR_MSG_CMD || len < (int)sizeof(CmdMsg)) return;
 
   g_lastCmdMs = millis();
   if (!g_sunKnown) {              // learn the Sun and switch to unicast replies (ESP-NOW only)
@@ -522,6 +543,10 @@ static void sendStatus() {
   s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
   s.rssi         = g_sunRssi;
   s.cfg_ok       = g_cfgOk ? 1 : 0;
+  s.fw_stamp     = g_fwStamp;
+  s.ota_state    = g_otaState;
+  s.ota_progress = g_otaProgress;
+  s.ota_err      = g_otaErr;
   g_homePulse    = false;
 
   const uint8_t *dst = g_sunKnown ? g_sunMac : BCAST_MAC;
@@ -542,8 +567,69 @@ static bool discoverChannel() {
   }
   WiFi.scanDelete();
   if (ch < 0) return false;
-  esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
+  g_sunChannel = (uint8_t)ch;
+  esp_wifi_set_channel(g_sunChannel, WIFI_SECOND_CHAN_NONE);
   return true;
+}
+
+// ----------------------------- Firmware update ------------------------------
+// Run a firmware update the Sun asked for: stop, join the Sun's AP, download the image over HTTP
+// (HTTPUpdate checks the Sun's x-MD5 header), report progress over ESP-NOW, reboot into it.
+// Blocking for the ~10-30 s it takes; the Sun only asks while the show is idle. On failure the
+// cart drops the AP, goes back to the Sun's channel and carries on with its current build.
+static uint32_t g_otaLastTxMs = 0;
+
+static void otaReport(uint8_t state, bool force) {
+  g_otaState = state;
+  if (force || millis() - g_otaLastTxMs >= 500) { g_otaLastTxMs = millis(); sendStatus(); }
+}
+
+static void otaFail(int16_t err, const char *why) {
+  g_otaErr = err;
+  Serial.printf("OTA failed (%d): %s\n", err, why);
+  WiFi.disconnect(false, false);
+  if (g_sunChannel) esp_wifi_set_channel(g_sunChannel, WIFI_SECOND_CHAN_NONE);
+  otaReport(OTA_FAILED, true);
+}
+
+static void serviceOta() {
+  if (!g_otaPending) return;
+  OtaMsg m = g_rxOta;
+  g_otaPending = false;
+  m.ssid[sizeof(m.ssid) - 1] = 0; m.pass[sizeof(m.pass) - 1] = 0; m.url[sizeof(m.url) - 1] = 0;
+  if (m.fw_stamp == g_fwStamp) {               // already running it (the Sun sees our stamp too)
+    Serial.printf("OTA: already running build %lu\n", (unsigned long)g_fwStamp);
+    return;
+  }
+  Serial.printf("OTA: build %lu -> %lu from %s via AP '%s'\n", (unsigned long)g_fwStamp,
+                (unsigned long)m.fw_stamp, m.url, m.ssid);
+  g_selfTest = false;
+  if (g_motorsOn) motorsEnable(false);         // abrupt stop is fine: the show is idle
+  lightSet(false);
+  g_otaErr = 0; g_otaProgress = 0;
+  otaReport(OTA_JOINING, true);
+
+  WiFi.begin(m.ssid, m.pass[0] ? m.pass : nullptr);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { delay(100); otaReport(OTA_JOINING, false); }
+  if (WiFi.status() != WL_CONNECTED) { otaFail(1, "could not join the Sun's AP"); return; }
+
+  otaReport(OTA_DOWNLOADING, true);
+  httpUpdate.rebootOnUpdate(false);            // report OTA_DONE first, then reboot ourselves
+  httpUpdate.onProgress([](int done, int total) {
+    g_otaProgress = total > 0 ? (uint8_t)((int64_t)done * 100 / total) : 0;
+    otaReport(OTA_DOWNLOADING, false);
+  });
+  WiFiClient client;
+  t_httpUpdate_return r = httpUpdate.update(client, m.url);
+  if (r != HTTP_UPDATE_OK) {
+    otaFail((int16_t)httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+    return;
+  }
+  g_otaProgress = 100;
+  Serial.println("OTA: image verified, rebooting");
+  for (int k = 0; k < 3; k++) { otaReport(OTA_DONE, true); delay(150); }
+  ESP.restart();
 }
 
 static bool espnowStart() {
@@ -623,6 +709,7 @@ void setup() {
   while (!Serial && millis() - tUsb < 3000) delay(10);   // boot banner isn't lost
   delay(300);
   Serial.println("\n==== Solar System - PLANET boot ====");
+  Serial.printf("Firmware build: %s (%lu)\n", FW_ID + sizeof(SOLAR_FW_MARK) - 1, (unsigned long)g_fwStamp);
 
   pinMode(PIN_MOTOR_PWR, OUTPUT);  digitalWrite(PIN_MOTOR_PWR, LOW);  // motor supply asleep
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
@@ -638,6 +725,7 @@ void setup() {
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_HOME), homeIsr, FALLING);
 
+  WiFi.persistent(false);          // an OTA join must not save the AP credentials to flash
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);   // run the radio cooler (see notes above)
@@ -663,6 +751,7 @@ void loop() {
   serviceStatusLed();
   serviceButton();
   serviceCommand();
+  serviceOta();
   serviceHoming();
   serviceRamp();
 

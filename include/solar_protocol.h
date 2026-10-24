@@ -11,6 +11,7 @@
 #define SOLAR_MAGIC        0x53          // 'S' — sanity marker on every packet
 #define SOLAR_MSG_CMD      'C'           // CmdMsg    (Sun  -> Planet)
 #define SOLAR_MSG_STATUS   'S'           // StatusMsg (Planet -> Sun)
+#define SOLAR_MSG_OTA      'O'           // OtaMsg    (Sun  -> Planet)
 
 #define SOLAR_PLANET_COUNT 8             // number of orbits / planet carts
 #define SOLAR_AP_SSID_DEFAULT "SolarSystem"   // planets scan for this to find the channel
@@ -79,7 +80,49 @@ struct __attribute__((packed)) CmdMsg {
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
 };
 
+// ------------------------ Cart firmware update (OTA) ------------------------
+// Every cart build embeds the text SOLAR_FW_MARK followed by __DATE__ " " __TIME__
+// ("Oct 25 2026 14:30:05"). The cart reports that build as a YYMMDDhhmm number (2610251430);
+// the Sun finds the same text in an uploaded image, so both sides agree on which build it is.
+#define SOLAR_FW_MARK      "SOLAR-PLANET-FW "
+#define SOLAR_FW_STAMP_LEN 20                        // strlen("Oct 25 2026 14:30:05")
+
+static inline uint32_t solarFwStamp(const char *dt) { // "Mmm dd yyyy hh:mm:ss" -> YYMMDDhhmm
+  static const char MONTHS[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  uint32_t mo = 0;
+  for (uint32_t k = 0; k < 12; k++)
+    if (dt[0] == MONTHS[3 * k] && dt[1] == MONTHS[3 * k + 1] && dt[2] == MONTHS[3 * k + 2]) mo = k + 1;
+  auto d2 = [](const char *p) -> uint32_t {            // two digits, a leading space counts as 0
+    return (uint32_t)((p[0] == ' ' ? 0 : p[0] - '0') * 10 + (p[1] - '0'));
+  };
+  return d2(dt + 9) * 100000000u + mo * 1000000u + d2(dt + 4) * 10000u + d2(dt + 12) * 100u + d2(dt + 15);
+}
+
+// Cart OTA progress, reported in StatusMsg.ota_state.
+enum OtaState : uint8_t {
+  OTA_IDLE = 0,
+  OTA_JOINING,         // joining the Sun's AP to download
+  OTA_DOWNLOADING,     // ota_progress = 0..100 %
+  OTA_DONE,            // image written and verified; rebooting into it
+  OTA_FAILED,          // ota_err says why; the cart carries on with its current build
+};
+
+// Sun -> Planet: fetch a new firmware image from the Sun and reboot into it. Sent only while the
+// show is idle, to one cart at a time. The carts have no Wi-Fi credentials, so the Sun's AP
+// SSID/password travel here (the AP is the Sun's own installation network).
+struct __attribute__((packed)) OtaMsg {
+  uint8_t  magic;         // = SOLAR_MAGIC
+  uint8_t  type;          // = SOLAR_MSG_OTA
+  uint8_t  planet_index;
+  uint32_t fw_stamp;      // build on offer (YYMMDDhhmm); a cart already running it ignores this
+  char     ssid[33];
+  char     pass[65];      // "" = open AP
+  char     url[64];       // e.g. "http://192.168.4.1/planet.bin"
+};
+
 // Planet -> Sun. Broadcast until the Sun's MAC is learned, then unicast to it.
+// The fields from fw_stamp on were added later: carts on older firmware send the message without
+// them, and the Sun accepts that (missing fields read as 0, i.e. "old build").
 struct __attribute__((packed)) StatusMsg {
   uint8_t  magic;         // = SOLAR_MAGIC
   uint8_t  type;          // = SOLAR_MSG_STATUS
@@ -91,6 +134,11 @@ struct __attribute__((packed)) StatusMsg {
   int8_t   temp_c;        // ESP32-C3 internal die temperature, °C (INT8_MIN = unknown)
   int8_t   rssi;          // last measured Sun-AP signal, dBm (0 = unknown)
   uint8_t  cfg_ok;        // 1 = last driver-param apply verified over UART (read-back + IFCNT)
+  uint32_t fw_stamp;      // running build, YYMMDDhhmm (see SOLAR_FW_MARK)
+  uint8_t  ota_state;     // OtaState
+  uint8_t  ota_progress;  // 0..100 % while OTA_DOWNLOADING
+  int16_t  ota_err;       // why OTA_FAILED: 1 = couldn't join the AP, else HTTPUpdate's error code
 };
+#define SOLAR_STATUS_V1_LEN 10   // StatusMsg size before fw_stamp (older cart firmware)
 
 #define PLANET_INDEX_UNKNOWN 0xFF

@@ -41,6 +41,7 @@ svg{display:block;width:100%;max-width:400px;margin:0 auto}
 .ptab .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .ptab .hot{color:var(--red);font-weight:700}
 .ptab .er{color:var(--red)}
+.ptab .ok{color:var(--grn)}.ptab .wa{color:var(--acc)}
 .stats{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:12px}
 .stat b{display:block;font-size:30px}
 .stat span{color:var(--mut);font-size:13px}
@@ -77,7 +78,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="mode" id="mode">--</div>
 <div class="timer" id="timer">00:00:00</div>
 <svg viewBox="0 0 400 400" id="sky"></svg>
-<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>Fault</th></tr></thead>
+<table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>FW</th><th>Fault</th></tr></thead>
 <tbody id="ptab"></tbody></table>
 <div id="log"></div>
 </div>
@@ -89,6 +90,20 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div class="stat"><b id="st_trig">0</b><span>Presses that started the show</span></div>
 <div class="stat"><b id="st_ign">0</b><span>Presses ignored</span></div>
 </div>
+</div>
+
+<div class="card"><h2>Cart firmware</h2>
+<div class="mode" id="fw_info">--</div>
+<div class="row" style="margin-top:10px;align-items:center">
+<input type="file" id="fw_file" accept=".bin" style="flex:1;min-width:0">
+<button class="b-test" onclick="fwUpload()">Upload</button>
+</div>
+<div class="row" style="margin-top:10px">
+<select id="fw_target" style="flex:1;min-width:0"><option value="-1">All carts</option></select>
+<button class="b-start" onclick="fwUpdate()">Update</button>
+</div>
+<div class="mode" style="margin-top:8px">Upload .pio/build/solar_planet_esp32c3/firmware.bin. Carts update one
+at a time, only while the show is idle: each stops, downloads the image from the Sun, checks it and reboots.</div>
 </div>
 
 <div class="card"><h2>Settings</h2>
@@ -176,6 +191,10 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   $('#n_ap').textContent=d.net.ap_ip||'--';
   setLink($('#n_mdns'),d.net.mdns,'--');}
  const ERRTXT=['','motor disconnected','motor stuck'];let rows='';
+ const cf=d.cart_fw||{};
+ if(!fwBusy)$('#fw_info').textContent=cf.present?('On the Sun: build '+fwtxt(cf.stamp,1)+' · '+
+  Math.round(cf.size/1024)+' KB'+(cf.name?' · '+cf.name:'')):'No cart firmware uploaded to the Sun yet.';
+ const OTATXT=['starting…','joining AP…','','rebooting…','failed'];
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
   p.orbital=pl.orbital_rpm;p.homeDeg=pl.home_deg;
@@ -187,12 +206,35 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   const temp=tc==null?'—':('<span class="'+(tc>=70?'hot':'')+'">'+tc+'&deg;C</span>');
   const fault=pl.error?('<span class="er">'+(ERRTXT[pl.error]||('err '+pl.error))+'</span>'):(pl.online?'ok':'—');
   const cfg=!pl.online?'—':(pl.cfg_ok?'ok':'<span class="er">CHECK</span>');
+  let fw='—';                                   // build, or update progress while being updated
+  if(pl.ota!=null)fw='<span class="wa">'+(pl.ota===2?pl.ota_pct+'%':OTATXT[pl.ota])+'</span>';
+  else if(pl.ota_queued)fw='<span class="wa">queued</span>';
+  else if(pl.online)fw=pl.fw?('<span class="'+(cf.present&&pl.fw===cf.stamp?'ok':'wa')+'">'+fwtxt(pl.fw)+'</span>')
+   :'<span class="wa">old</span>';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
-   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fault+'</td></tr>';
+   '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fw+'</td><td>'+fault+'</td></tr>';
  });
  $('#ptab').innerHTML=rows;
  $('#log').textContent=(d.log||[]).join('\n');
 }).catch(()=>{})}
+
+/* ---- cart firmware (OTA) ---- */
+let fwBusy=false;                                 // uploading: keep the progress text on screen
+function fwtxt(s,full){const p=n=>String(Math.floor(n)%100).padStart(2,'0');   // YYMMDDhhmm
+ const t=p(s/1e6)+'-'+p(s/1e4)+' '+p(s/100)+':'+p(s);return full?'20'+p(s/1e8)+'-'+t:t}
+function fwUpload(){const f=$('#fw_file').files[0];if(!f){toast('choose a .bin file');return}
+ const fd=new FormData();fd.append('fw',f,f.name);const x=new XMLHttpRequest();fwBusy=true;
+ x.upload.onprogress=e=>{if(e.lengthComputable)
+  $('#fw_info').textContent='Uploading '+Math.round(e.loaded*100/e.total)+'%…'};
+ x.onloadend=()=>{fwBusy=false;let r={};try{r=JSON.parse(x.responseText)}catch(e){}
+  toast(r.ok?'uploaded':('upload failed: '+(r.error||('HTTP '+x.status))))};
+ x.open('POST','/api/planet_fw');x.send(fd)}
+function fwUpdate(){const t=+$('#fw_target').value;
+ if(!confirm('Update '+(t<0?'all carts':PLANETS[t])+' now? Each cart stops, downloads the image and reboots.'))return;
+ fetch('/api/planet_ota',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({planet:t})})
+  .then(r=>r.json()).then(r=>toast(r.ok?'update queued':r.error)).catch(()=>toast('request failed'))}
+PLANETS.forEach((n,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+n;
+ $('#fw_target').appendChild(o)});
 
 /* ---- settings (recursive form bound to a live cfg object) ---- */
 let cfg=null;
