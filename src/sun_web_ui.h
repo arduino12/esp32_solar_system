@@ -99,7 +99,8 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <button class="b-test" onclick="fwUpload()">Upload</button>
 </div>
 <div class="mode" style="margin-top:8px">Upload .pio/build/solar_planet_esp32c3/firmware.bin. While the show is
-idle, every cart running a different build downloads it from the Sun (all at once), checks it and reboots.
+idle, every cart running an older build downloads it from the Sun (all at once), checks it and reboots;
+a cart flashed with a newer build (e.g. over USB) is left as is.
 A show pauses the downloads. Turn off planets &rsaquo; auto_update_firmware in Settings to hold the carts.</div>
 </div>
 
@@ -167,7 +168,8 @@ let last=0;
 function anim(t){
  const dt=last?t-last:16;last=t;
  for(const p of view){
-  if(p.online) p.angle+=p.orbital*360/60000*dt;  // rpm -> deg/ms
+  if(p.online) p.angle-=p.orbital*360/60000*dt;  // rpm -> deg/ms; SVG y points down, so a
+                                                 // decreasing angle is counter-clockwise
   const a=p.angle*Math.PI/180, x=CX+p.r*Math.cos(a), y=CY+p.r*Math.sin(a);
   p.dot.setAttribute('cx',x);p.dot.setAttribute('cy',y);
   p.dot.setAttribute('fill',p.online?p.color:'#3b4557');
@@ -205,8 +207,10 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   let fw='—';                                   // build; download progress / result while updating
   if(pl.online)fw=pl.ota===1?'<span class="wa">&darr; '+pl.ota_pct+'%</span>'
    :pl.ota===2?'<span class="wa">rebooting…</span>'
-   :'<span class="'+(pl.ota===3?'er':cf.present&&pl.fw===cf.stamp?'ok':'wa')+'"'+
-    (pl.ota===3?' title="update failed, error '+pl.ota_err+'"':'')+'>'+fwtxt(pl.fw)+'</span>';
+   :'<span class="'+(pl.ota===3?'er':!cf.present||pl.fw===cf.stamp?'ok':pl.fw<cf.stamp?'wa':'')+'"'+
+    ' title="'+(pl.ota===3?'update failed, error '+pl.ota_err:!cf.present||pl.fw===cf.stamp?'up to date':
+    pl.fw<cf.stamp?'older than the Sun\'s image: will update while idle':'newer than the Sun\'s image: left as is')+
+    '">'+fwtxt(pl.fw)+'</span>';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
    '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fw+'</td><td>'+fault+'</td></tr>';
  });
@@ -216,8 +220,10 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
 
 /* ---- cart firmware (OTA) ---- */
 let fwBusy=false;                                 // uploading: keep the progress text on screen
-function fwtxt(s,full){const p=n=>String(Math.floor(n)%100).padStart(2,'0');   // YYMMDDhhmm
- const t=p(s/1e6)+'-'+p(s/1e4)+' '+p(s/100)+':'+p(s);return full?'20'+p(s/1e8)+'-'+t:t}
+function fwtxt(s,full){if(!s)return '—';          // build stamp (UTC Unix s) -> local time
+ const d=new Date(s*1000),p=n=>String(n).padStart(2,'0');
+ const t=p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+ return full?d.getFullYear()+'-'+t:t}
 function fwUpload(){const f=$('#fw_file').files[0];if(!f){toast('choose a .bin file');return}
  const fd=new FormData();fd.append('fw',f,f.name);const x=new XMLHttpRequest();fwBusy=true;
  x.upload.onprogress=e=>{if(e.lengthComputable)

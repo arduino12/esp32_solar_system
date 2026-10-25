@@ -80,32 +80,31 @@ struct __attribute__((packed)) CmdMsg {
   float    step_degree;   // motor step angle (deg/full-step, e.g. 1.8) -> steps/rev
   // Cart firmware on offer (see "Cart firmware update" below). fw_stamp = 0: nothing offered now
   // (no image, auto-update off, or the show is running) -> a cart pauses any download.
-  uint32_t fw_stamp;      // build stamp of the Sun's cart image (YYMMDDhhmm)
+  uint32_t fw_stamp;      // build stamp of the Sun's cart image (UTC Unix seconds)
   uint32_t fw_size;       // image length, bytes
   uint8_t  fw_md5[16];    // MD5 of the image; the cart verifies it before booting into it
 };
 
 // ------------------------ Cart firmware update ------------------------------
-// The Sun keeps the last uploaded cart image in its own flash partition and offers it in every
-// CmdMsg. A cart whose build differs pulls the image over ESP-NOW while the show is idle: it asks
-// for bytes at an offset (FwReqMsg) and the Sun answers with up to `count` chunks (FwDataMsg).
-// The Sun keeps no per-cart state, so any number of carts download at once. No Wi-Fi join.
+// The Sun keeps the last uploaded cart image (LittleFS) and offers it in every CmdMsg. A cart
+// running an OLDER build pulls the image over ESP-NOW while the show is idle: it asks for bytes at
+// an offset (FwReqMsg) and the Sun answers with up to `count` chunks (FwDataMsg). The Sun keeps
+// no per-cart state, so any number of carts download at once. No Wi-Fi join. A cart flashed with
+// a newer build (e.g. over USB while testing) is left alone.
 //
-// Every cart build embeds the text SOLAR_FW_MARK followed by __DATE__ " " __TIME__
-// ("Oct 25 2026 14:30:05"). The cart reports that build as a YYMMDDhhmm number (2610251430);
-// the Sun finds the same text in an uploaded image, so both sides agree on which build it is.
+// Build stamp: the build time in UTC Unix seconds (SOLAR_FW_BUILD_UTC, set by
+// scripts/fw_build_stamp.py), so it only ever increases. Every cart build embeds SOLAR_FW_MARK
+// followed by the stamp as 10 decimal digits; the Sun reads it out of an uploaded image.
 #define SOLAR_FW_MARK      "SOLAR-PLANET-FW "
-#define SOLAR_FW_STAMP_LEN 20                        // strlen("Oct 25 2026 14:30:05")
+#define SOLAR_FW_STAMP_LEN 10                        // decimal digits of the Unix time
 
-static inline uint32_t solarFwStamp(const char *dt) { // "Mmm dd yyyy hh:mm:ss" -> YYMMDDhhmm
-  static const char MONTHS[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-  uint32_t mo = 0;
-  for (uint32_t k = 0; k < 12; k++)
-    if (dt[0] == MONTHS[3 * k] && dt[1] == MONTHS[3 * k + 1] && dt[2] == MONTHS[3 * k + 2]) mo = k + 1;
-  auto d2 = [](const char *p) -> uint32_t {            // two digits, a leading space counts as 0
-    return (uint32_t)((p[0] == ' ' ? 0 : p[0] - '0') * 10 + (p[1] - '0'));
-  };
-  return d2(dt + 9) * 100000000u + mo * 1000000u + d2(dt + 4) * 10000u + d2(dt + 12) * 100u + d2(dt + 15);
+static inline uint32_t solarFwStamp(const char *digits) {   // the 10 digits after SOLAR_FW_MARK
+  uint32_t v = 0;
+  for (int k = 0; k < SOLAR_FW_STAMP_LEN; k++) {
+    if (digits[k] < '0' || digits[k] > '9') return 0;
+    v = v * 10 + (uint32_t)(digits[k] - '0');
+  }
+  return v;
 }
 
 // Cart download progress, reported in StatusMsg.ota_state.
@@ -150,7 +149,7 @@ struct __attribute__((packed)) StatusMsg {
   int8_t   temp_c;        // ESP32-C3 internal die temperature, °C (INT8_MIN = unknown)
   int8_t   rssi;          // last measured Sun-AP signal, dBm (0 = unknown)
   uint8_t  cfg_ok;        // 1 = last driver-param apply verified over UART (read-back + IFCNT)
-  uint32_t fw_stamp;      // running build, YYMMDDhhmm (see SOLAR_FW_MARK)
+  uint32_t fw_stamp;      // running build stamp, UTC Unix seconds (see SOLAR_FW_MARK)
   uint8_t  ota_state;     // OtaState
   uint8_t  ota_progress;  // 0..100 % while OTA_DOWNLOADING
   int16_t  ota_err;       // why OTA_FAILED: an Update library error, or OTA_ERR_* below

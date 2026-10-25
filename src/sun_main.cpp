@@ -42,6 +42,8 @@ static uint32_t  g_lastFireMs = 0;
 // ----------------------------- Timing constants ------------------------------
 #define HEARTBEAT_MS    2000        // resend current command set to planets
 #define HOMING_BASE_RPM 40.0f       // wheel reference speed while homing for menorah
+#define ORBIT_SIGN      1.0f        // wheel-speed sign that orbits counter-clockwise (all planets);
+                                    // -1.0f if the carts turn out to go clockwise
 #define STA_RETRY_MS    60000
 #define FACTORY_HOLD_MS 5000
 #define LOG_N           12
@@ -106,6 +108,8 @@ struct PlanetState {
   uint8_t  otaState;      // OtaState reported by the cart
   uint8_t  otaProgress;   // 0..100 % while downloading
   int16_t  otaErr;        // reason for OTA_FAILED
+  uint32_t txOk, txFail;  // ESP-NOW unicasts to this cart that were / weren't ACKed by its radio
+  uint8_t  txFailRun;     // consecutive unACKed unicasts
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
 
@@ -405,9 +409,9 @@ static CmdMsg buildRunCmd(int i, bool light) {
   float wheelR = base * (Rin / Rout);     // inner track proportionally slower
   if (wheelL > maxRpm) { float k = maxRpm / wheelL; wheelL *= k; wheelR *= k; }
 
-  float sign = (i % 2 == 0) ? 1.0f : -1.0f;   // alternate direction for visual variety
+  float sign = ORBIT_SIGN;                // every planet orbits the same way: counter-clockwise
   float orbital = (Rout > 0.1f) ? (wheelL * dWheel / (2.0f * Rout)) : 0.0f;
-  g_planet[i].orbitalRpm = orbital * sign;
+  g_planet[i].orbitalRpm = orbital;       // orbital speed, positive = counter-clockwise (web UI)
 
   CmdMsg m = {};
   m.magic = SOLAR_MAGIC; m.type = SOLAR_MSG_CMD; m.planet_index = i;
@@ -439,8 +443,8 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
     float outerD = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
     float Rout = outerD * 0.5f, Rin = Rout - railW;
     if (Rin < 1.0f) Rin = 1.0f;
-    m.wheel_l_rpm = HOMING_BASE_RPM;                 // outer wheel (faster)
-    m.wheel_r_rpm = HOMING_BASE_RPM * (Rin / Rout);  // inner wheel (slower)
+    m.wheel_l_rpm = ORBIT_SIGN * HOMING_BASE_RPM;                 // outer wheel (faster)
+    m.wheel_r_rpm = ORBIT_SIGN * HOMING_BASE_RPM * (Rin / Rout);  // inner wheel (slower)
     g_planet[i].orbitalRpm = 0;
   } else {
     g_planet[i].orbitalRpm = 0;
@@ -578,13 +582,21 @@ static void serviceStateMachine() {
 
 // ----------------------------- Cart firmware update ---------------------------
 // The last uploaded cart image is the LittleFS file CART_FW_PATH. While IDLE (and auto-update is
-// on) every CmdMsg offers it; a cart whose build differs pulls it over ESP-NOW with FwReqMsg and
+// on) every CmdMsg offers it; a cart running an older build pulls it over ESP-NOW with FwReqMsg and
 // the Sun answers each request with FwDataMsg chunks read from the file. Nothing per cart is kept
 // here, so any number of carts download at once. The ESP-NOW callback only queues the requests;
 // loop() reads the file and sends the chunks.
 static String   g_upErr;                    // why the last upload was rejected ("" = accepted)
 static File     g_upFile;
 static volatile bool g_fwUploaded = false;  // an upload finished: log it from loop()
+
+static String fwStampText(uint32_t s) {     // build stamp (UTC Unix seconds) -> readable
+  time_t t = s; struct tm b; gmtime_r(&t, &b);
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d UTC", b.tm_year + 1900, b.tm_mon + 1,
+           b.tm_mday, b.tm_hour, b.tm_min);
+  return String(buf);
+}
 
 // Inspect CART_FW_PATH: it must be one complete ESP32-C3 app image (header + segments + checksum
 // padding + optional SHA-256 add up to the file size) carrying the SOLAR_FW_MARK build stamp.
@@ -622,7 +634,11 @@ static void loadCartFw() {
       char c = (char)buf[k];
       if (capturing) {
         cap[capLen++] = c;
-        if (capLen == SOLAR_FW_STAMP_LEN) { cap[capLen] = 0; fw.stamp = solarFwStamp(cap); }
+        if (capLen == SOLAR_FW_STAMP_LEN) {            // always stop here: cap[] is full
+          cap[capLen] = 0;
+          fw.stamp = solarFwStamp(cap);                // 0 if not digits -> look for another marker
+          capturing = false; mk = 0;
+        }
       } else if (c == MK[mk]) {
         if (++mk == sizeof(MK) - 1) { capturing = true; capLen = 0; }
       } else {
@@ -694,10 +710,53 @@ static void serviceFwRequests() {
 }
 
 // Uploads and each cart's download progress, for the web log.
+// ----------------------------- Link watch ------------------------------------
+// ESP-NOW unicasts are ACKed by the receiving radio, so onSent() counts per cart which commands
+// arrived. serviceLinkWatch() logs (serial) when a cart stops ACKing or stops sending status for
+// > LINK_GAP_MS, and when it recovers, to tell which side of a link drop failed.
+#define LINK_GAP_MS 3000
+static void onSent(const uint8_t *mac, esp_now_send_status_t st) {
+  int i = planetByMac(mac);
+  if (i < 0) return;
+  PlanetState &p = g_planet[i];
+  if (st == ESP_NOW_SEND_SUCCESS) { p.txOk++; p.txFailRun = 0; }
+  else                            { p.txFail++; if (p.txFailRun < 255) p.txFailRun++; }
+}
+
+static void serviceLinkWatch() {
+  static bool     statusGap[SOLAR_PLANET_COUNT], failing[SOLAR_PLANET_COUNT];
+  static uint32_t gapFrom[SOLAR_PLANET_COUNT];
+  uint32_t now = millis();
+  for (int i = 0; i < SOLAR_PLANET_COUNT; i++) {
+    PlanetState &p = g_planet[i];
+    if (!g_macValid[i] || !p.lastSeenMs) continue;
+    uint32_t last = p.lastSeenMs;
+    if (!statusGap[i] && now - last > LINK_GAP_MS) {
+      statusGap[i] = true; gapFrom[i] = last;
+      Serial.printf("[%lu] LINK p%d: no status for %lu ms (commands ACKed %lu, not %lu)\n",
+                    (unsigned long)now, i, (unsigned long)(now - last),
+                    (unsigned long)p.txOk, (unsigned long)p.txFail);
+    } else if (statusGap[i] && last != gapFrom[i]) {
+      statusGap[i] = false;
+      Serial.printf("[%lu] LINK p%d: status back after %lu ms (commands ACKed %lu, not %lu)\n",
+                    (unsigned long)now, i, (unsigned long)(last - gapFrom[i]),
+                    (unsigned long)p.txOk, (unsigned long)p.txFail);
+    }
+    uint8_t run = p.txFailRun;
+    if (!failing[i] && run >= 2) {
+      failing[i] = true;
+      Serial.printf("[%lu] LINK p%d: commands not ACKed (%u in a row)\n", (unsigned long)now, i, run);
+    } else if (failing[i] && run == 0) {
+      failing[i] = false;
+      Serial.printf("[%lu] LINK p%d: commands ACKed again\n", (unsigned long)now, i);
+    }
+  }
+}
+
 static void serviceCartFw() {
   if (g_fwUploaded) {
     g_fwUploaded = false;
-    addLog(g_fw.present ? "Cart firmware uploaded: build " + String(g_fw.stamp) + " (" +
+    addLog(g_fw.present ? "Cart firmware uploaded: build " + fwStampText(g_fw.stamp) + " (" +
                           String(g_fw.size / 1024) + " KB)"
                         : "Cart firmware upload rejected: " + g_upErr);
   }
@@ -713,7 +772,7 @@ static void serviceCartFw() {
       lastState[i] = p.otaState;
     }
     if (p.fwStamp != lastStamp[i]) {
-      if (lastStamp[i]) addLog("Planet " + String(i) + ": now runs build " + String(p.fwStamp));
+      if (lastStamp[i]) addLog("Planet " + String(i) + ": now runs build " + fwStampText(p.fwStamp));
       lastStamp[i] = p.fwStamp;
     }
   }
@@ -844,6 +903,8 @@ static void buildStatusJson(String &out) {
       o["ota_pct"]  = g_planet[i].otaProgress;
       o["ota_err"]  = g_planet[i].otaErr;
     }
+    o["tx_ok"]   = g_planet[i].txOk;           // commands ACKed / not ACKed by the cart's radio
+    o["tx_fail"] = g_planet[i].txFail;
   }
 
   JsonObject fw = d["cart_fw"].to<JsonObject>();
@@ -980,7 +1041,7 @@ void setup() {
   Serial.println("\n==== Solar System — SUN boot ====");
   dumpFileToSerial("/settings.json");
   dumpFileToSerial("/stats.json");
-  if (g_fw.present) Serial.printf("Cart firmware: build %lu, %lu bytes\n", (unsigned long)g_fw.stamp, (unsigned long)g_fw.size);
+  if (g_fw.present) Serial.printf("Cart firmware: build %s, %lu bytes\n", fwStampText(g_fw.stamp).c_str(), (unsigned long)g_fw.size);
   else              Serial.println("Cart firmware: none uploaded");
 
   FastLED.addLeds<LED_TYPE, PIN_LED, LED_ORDER>(g_leds, NUM_LEDS);
@@ -997,6 +1058,7 @@ void setup() {
 
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(onRecv);
+    esp_now_register_send_cb(onSent);
     refreshPeers();
   } else {
     Serial.println("ESP-NOW init failed!");
@@ -1013,6 +1075,7 @@ void loop() {
   wifiLogEvents();
   wifiRetry();
   serviceCartFw();
+  serviceLinkWatch();
   ElegantOTA.loop();
 
   if (g_reloadSettings) { g_reloadSettings = false; applyPendingSettings(); }

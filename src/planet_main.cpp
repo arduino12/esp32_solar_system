@@ -37,8 +37,13 @@
 #include "solar_protocol.h"
 
 // Build identity: the Sun reads this marker out of an uploaded image (see SOLAR_FW_MARK).
-static const char FW_ID[] = SOLAR_FW_MARK __DATE__ " " __TIME__;
-static const uint32_t g_fwStamp = solarFwStamp(FW_ID + sizeof(SOLAR_FW_MARK) - 1);
+#ifndef SOLAR_FW_BUILD_UTC
+#error "SOLAR_FW_BUILD_UTC is set by scripts/fw_build_stamp.py (extra_scripts in platformio.ini)"
+#endif
+#define FW_STR2(x) #x
+#define FW_STR(x)  FW_STR2(x)
+static const char FW_ID[] = SOLAR_FW_MARK FW_STR(SOLAR_FW_BUILD_UTC);
+static const uint32_t g_fwStamp = SOLAR_FW_BUILD_UTC;   // UTC Unix seconds of this build
 
 // ----------------------------- Pin map (from spec) --------------------------
 static const uint8_t PIN_TMC_EN     = 2;   // TMC enable, active-low (LOW = drivers on)
@@ -574,6 +579,7 @@ static void sendStatus() {
 // Scan for the Sun's AP to discover its Wi-Fi channel, then lock onto it. Blocking (~2s);
 // only called at boot and while OFFLINE, so it never stalls active operation.
 static bool discoverChannel() {
+  uint32_t t0 = millis();
   int n = WiFi.scanNetworks(false, true);
   int ch = -1;
   for (int i = 0; i < n; i++) {
@@ -584,13 +590,15 @@ static bool discoverChannel() {
     }
   }
   WiFi.scanDelete();
+  Serial.printf("[%lu] LINK rescan: Sun on ch %d (%d dBm), took %lu ms\n", (unsigned long)millis(),
+                ch, g_sunRssi, (unsigned long)(millis() - t0));
   if (ch < 0) return false;
   esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
   return true;
 }
 
 // ----------------------------- Firmware update ------------------------------
-// Pull the Sun's cart image when its build differs from ours: ask for FW_BURST chunks from the
+// Pull the Sun's cart image when its build is newer than ours: ask for FW_BURST chunks from the
 // current offset, write the ones that arrive in order (Update buffers them into flash sectors),
 // ask again. Runs only while the motors are off and the Sun offers the image (it stops offering
 // while a show runs -> the download pauses where it is). Update.end() checks the MD5 and switches
@@ -614,7 +622,8 @@ static void fwStop(uint8_t state, int16_t err) {      // OTA_IDLE = abandoned, O
 
 static void serviceFwDownload() {
   uint32_t now = millis();
-  bool offered = g_offerStamp && g_offerStamp != g_fwStamp && g_sunKnown && !g_motorsOn && !g_selfTest;
+  // Only ever move to a NEWER build: a cart flashed with something newer (USB, testing) stays put.
+  bool offered = g_offerStamp > g_fwStamp && g_sunKnown && !g_motorsOn && !g_selfTest;
   if (!g_dlActive) {
     g_fwRxTail = g_fwRxHead;                            // drop stray chunks
     if (!offered) return;
@@ -719,6 +728,26 @@ static void serviceButton() {
   }
 }
 
+// ----------------------------- Link watch -----------------------------------
+// Log when commands from the Sun stop for longer than LINK_GAP_MS and when they come back
+// (the Sun sends each cart a command every ~2 s), to diagnose link drops.
+#define LINK_GAP_MS 3000
+static void serviceLinkWatch() {
+  static bool     gap = false;
+  static uint32_t gapFrom = 0;
+  uint32_t last = g_lastCmdMs, now = millis();
+  if (!g_sunKnown) return;
+  if (!gap && now - last > LINK_GAP_MS) {
+    gap = true; gapFrom = last;
+    Serial.printf("[%lu] LINK gap: no command from the Sun for %lu ms\n", (unsigned long)now,
+                  (unsigned long)(now - last));
+  } else if (gap && last != gapFrom) {
+    gap = false;
+    Serial.printf("[%lu] LINK back: commands again after %lu ms\n", (unsigned long)now,
+                  (unsigned long)(last - gapFrom));
+  }
+}
+
 // ----------------------------- State update ---------------------------------
 static void updateState() {
   if (millis() - g_lastCmdMs > 5000) {
@@ -745,7 +774,9 @@ void setup() {
   while (!Serial && millis() - tUsb < 3000) delay(10);   // boot banner isn't lost
   delay(300);
   Serial.println("\n==== Solar System - PLANET boot ====");
-  Serial.printf("Firmware build: %s (%lu)\n", FW_ID + sizeof(SOLAR_FW_MARK) - 1, (unsigned long)g_fwStamp);
+  time_t bt = g_fwStamp; struct tm b; gmtime_r(&bt, &b);
+  Serial.printf("Firmware build %s = %04d-%02d-%02d %02d:%02d:%02d UTC\n", FW_ID + sizeof(SOLAR_FW_MARK) - 1,
+                b.tm_year + 1900, b.tm_mon + 1, b.tm_mday, b.tm_hour, b.tm_min, b.tm_sec);
 
   pinMode(PIN_MOTOR_PWR, OUTPUT);  digitalWrite(PIN_MOTOR_PWR, LOW);  // motor supply asleep
   pinMode(PIN_TMC_EN, OUTPUT);     digitalWrite(PIN_TMC_EN, HIGH);   // drivers off
@@ -783,6 +814,7 @@ void loop() {
   uint32_t now = millis();
 
   updateState();
+  serviceLinkWatch();
   serviceStatusLed();
   serviceButton();
   serviceCommand();
