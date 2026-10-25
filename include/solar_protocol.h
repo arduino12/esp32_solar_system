@@ -48,8 +48,12 @@ enum PlanetErr : uint8_t {
 //   bits [0..3]  microsteps as an enum = log2(microsteps): 0->1, 1->2, ... 8->256
 //   bit  [4]     chopper mode: 0 = stealthChop (quiet), 1 = spreadCycle (torque/noise)
 //   bit  [5]     MicroPlyer: 1 = interpolate microsteps up to 256 internally
+//   bit  [6]     reverse the left wheel  } per cart: carts differ in how the motors are mounted and
+//   bit  [7]     reverse the right wheel } wired, and all of them run the same firmware image
 #define SOLAR_DRVCFG_CHOP    0x10
 #define SOLAR_DRVCFG_INTERP  0x20
+#define SOLAR_DRVCFG_REV_L   0x40
+#define SOLAR_DRVCFG_REV_R   0x80
 
 static inline uint8_t solarMicrostepsToEnum(uint16_t m) {
   uint8_t e = 0;

@@ -71,11 +71,13 @@ static const uint8_t PIN_BUTTON     = 9;   // onboard boot button, active-low
 // ----------------------------- Motor / TMC config ---------------------------
 #define TMC_R_SENSE        0.11f
 #define TMC_UART_BAUD      115200
+// UART addresses (MS1/MS2 straps) differ between cart boards: the first cart has L=3 R=2, the new
+// cart PCB 0 and 3. These are only the defaults; tmcFindDrivers() finds the real ones.
 #define TMC_ADDR_L         0b11            // MS1=VIO MS2=VIO
 #define TMC_ADDR_R         0b10            // MS1=GND MS2=VIO
-#define WHEEL_R_INVERT     false           // true flips the right wheel. The first cart (wheels
-                                           // back-to-back) needed true; the new cart PCB rolls
-                                           // both wheels the same way without the flip.
+// Wheel direction differs between carts (the first cart's wheels sit back-to-back and need the
+// right one reversed, the new cart PCB needs neither), so it is a per-planet Sun setting
+// (planets.wheels.reverse_per) sent in CmdMsg.driver_cfg, not a build option.
 #define TMC_READY_TIMEOUT_MS 300           // max wait for the drivers to answer after VM switches on
 // LEDC step generation. Channels must sit on DIFFERENT timers to run at independent speeds
 // (timer = channel/2, one frequency per timer): ch0->timer0, ch2->timer1. Both timers still
@@ -103,12 +105,17 @@ static uint16_t g_microsteps  = 16;        // 1..256 (uint16: 256 does not fit i
 static float    g_stepDegree  = 1.8f;      // motor step angle -> full steps/rev = 360/step_degree
 static bool     g_spread      = false;     // chopper: false = stealthChop (quiet), true = spreadCycle
 static bool     g_interpolate = true;      // MicroPlyer: interpolate microsteps up to 256 internally
-static bool     g_cfgOk       = false;     // last applyDriverParams() verified over UART?
+static bool     g_revL = false, g_revR = false;   // reverse a wheel (per cart, set on the Sun)
+static bool     g_cfgOk      = false;     // last applyDriverParams() verified over UART?
 static bool     g_cfgStale    = false;     // params changed while asleep -> apply on next wake
 
 HardwareSerial   TMC_SERIAL(1);            // ESP32-C3 UART1
-TMC2209Stepper   drvL(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_L);
-TMC2209Stepper   drvR(&TMC_SERIAL, TMC_R_SENSE, TMC_ADDR_R);
+// One driver object per UART address; drvL/drvR point at the two that answer.
+static TMC2209Stepper g_drv[4] = {
+  TMC2209Stepper(&TMC_SERIAL, TMC_R_SENSE, 0), TMC2209Stepper(&TMC_SERIAL, TMC_R_SENSE, 1),
+  TMC2209Stepper(&TMC_SERIAL, TMC_R_SENSE, 2), TMC2209Stepper(&TMC_SERIAL, TMC_R_SENSE, 3)};
+static TMC2209Stepper *drvL = &g_drv[TMC_ADDR_L], *drvR = &g_drv[TMC_ADDR_R];
+static bool g_drvFound = false;            // drvL/drvR confirmed by tmcFindDrivers()
 
 static uint8_t  g_lightBrightness = 100;   // Sun-chosen brightness, 0..100 %; shown when on
 
@@ -141,9 +148,11 @@ static uint16_t g_pendingMicro   = 16;
 static uint16_t g_pendingCurrent = 200;
 static bool     g_pendingSpread  = false;
 static bool     g_pendingInterp  = true;
+static bool     g_pendingRevL = false, g_pendingRevR = false;
 
 // Diagnostics reported back to the Sun and printed in the heartbeat.
-static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
+static int8_t   g_sunRssi     = 0;         // Sun signal (dBm): live from its frames, else last scan
+static volatile int16_t g_rssiQ16 = 0;     // live Sun RSSI, smoothed, in 1/16 dBm (0 = none yet)
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
 
 static volatile uint32_t g_lastCmdMs = 0;  // last time a valid command arrived (ESP-NOW callback)
@@ -283,28 +292,61 @@ static bool applyOneDriverVerified(TMC2209Stepper &d, char id, uint8_t maxTries)
 }
 
 static void applyDriverParams() {
-  bool okL = applyOneDriverVerified(drvL, 'L', 3);
-  bool okR = applyOneDriverVerified(drvR, 'R', 3);
+  bool okL = applyOneDriverVerified(*drvL, 'L', 3);
+  bool okR = applyOneDriverVerified(*drvR, 'R', 3);
   g_cfgOk = okL && okR;
   Serial.printf("driver cfg %s: I=%umA usteps=%u mode=%s mplyer=%d\n",
                 g_cfgOk ? "VERIFIED" : "UNVERIFIED(!)", g_currentMa, g_microsteps,
                 g_spread ? "spread" : "stealth", g_interpolate);
 }
 
+// Find the two wheel drivers: the two addresses that answer, told apart by which one sees
+// PIN_STEP_L held high in its IOIN register. Runs with EN high (outputs off), so the one STEP edge
+// only moves the driver's internal microstep counter. Silent on failure (tmcProbe() reports it).
+static bool tmcFindDrivers() {
+  uint8_t a[4], n = 0;
+  for (uint8_t i = 0; i < 4; i++) if (g_drv[i].version() == 0x21) a[n++] = i;
+  if (n != 2) return false;
+  ledcDetachPin(PIN_STEP_L);
+  pinMode(PIN_STEP_L, OUTPUT); digitalWrite(PIN_STEP_L, HIGH);
+  bool s0 = g_drv[a[0]].step(), s1 = g_drv[a[1]].step();
+  digitalWrite(PIN_STEP_L, LOW);
+  ledcAttachPin(PIN_STEP_L, LEDC_CH_L);
+  if (s0 == s1) return false;
+  drvL = &g_drv[s0 ? a[0] : a[1]];
+  drvR = &g_drv[s0 ? a[1] : a[0]];
+  g_drvFound = true;
+  Serial.printf("TMC drivers found: L at address %u, R at address %u\n",
+                (unsigned)(drvL - g_drv), (unsigned)(drvR - g_drv));
+  return true;
+}
+
 // The TMC2209 logic runs off its internal 5V regulator, i.e. off VM: with VM switched off the
-// drivers are unpowered and silent. Wait (bounded) until both answer (IOIN VERSION = 0x21).
+// drivers are unpowered and silent. Wait (bounded) until both answer (IOIN VERSION = 0x21),
+// finding them first if that hasn't happened yet.
 static bool driversReady(uint32_t timeoutMs) {
   uint32_t t0 = millis();
   do {
-    if (drvL.version() == 0x21 && drvR.version() == 0x21) return true;
+    if (!g_drvFound) { if (tmcFindDrivers()) return true; }
+    else if (drvL->version() == 0x21 && drvR->version() == 0x21) return true;
   } while (millis() - t0 < timeoutMs);
   return false;
+}
+
+// Which UART addresses answer? Printed when the drivers can't be found, to tell a missing motor
+// supply or a broken bus (none answer) from odd address straps.
+static void tmcProbe() {
+  Serial.print("TMC probe, addresses answering:");
+  bool any = false;
+  for (uint8_t a = 0; a < 4; a++)
+    if (g_drv[a].version() == 0x21) { Serial.printf(" %u", a); any = true; }
+  Serial.println(any ? "" : " none (motor supply off, or the UART line doesn't reach the drivers)");
 }
 
 // Full driver config: GCONF (which also carries the shaft/direction bit) + all params, verified.
 // Then clear GSTAT.reset, so a later wake can tell whether a VM power cycle wiped the registers.
 static void driversConfigure() {
-  TMC2209Stepper *all[2] = {&drvL, &drvR};
+  TMC2209Stepper *all[2] = {drvL, drvR};
   for (auto *d : all) {
     d->begin();
     d->toff(0);                 // chopper off until motors are enabled (driver fully idle/cool)
@@ -313,7 +355,7 @@ static void driversConfigure() {
     d->mstep_reg_select(true);  // microsteps set over UART, not MS1/MS2 pins
   }
   applyDriverParams();
-  drvL.GSTAT(0b111); drvR.GSTAT(0b111);         // write-1-to-clear reset/drv_err/uv_cp
+  drvL->GSTAT(0b111); drvR->GSTAT(0b111);       // write-1-to-clear reset/drv_err/uv_cp
   g_cfgStale = false;
 }
 
@@ -331,7 +373,7 @@ static void tmcBringup() {
   TMC_SERIAL.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_RX, PIN_TMC_TX);
   digitalWrite(PIN_MOTOR_PWR, HIGH);
   if (driversReady(TMC_READY_TIMEOUT_MS)) driversConfigure();
-  else { g_cfgOk = false; Serial.println("TMC drivers not answering on UART (VM missing?)"); }
+  else { g_cfgOk = false; Serial.println("TMC drivers not answering on UART (VM missing?)"); tmcProbe(); }
   digitalWrite(PIN_MOTOR_PWR, LOW);
 }
 
@@ -346,18 +388,19 @@ static void motorsEnable(bool on) {
     if (!driversReady(TMC_READY_TIMEOUT_MS)) {
       g_cfgOk = false;
       Serial.println("wake: TMC drivers not answering on UART (VM missing?)");
-    } else if (g_cfgStale || !g_cfgOk || drvL.reset() || drvR.reset()) {
+      tmcProbe();
+    } else if (g_cfgStale || !g_cfgOk || drvL->reset() || drvR->reset()) {
       Serial.println("wake: drivers reset by VM power-up (or params changed) -> configuring");
       driversConfigure();
     }
-    drvL.toff(4); drvR.toff(4);                 // re-assert chopper
+    drvL->toff(4); drvR->toff(4);               // re-assert chopper
     digitalWrite(PIN_TMC_EN, LOW);              // enable outputs (active-low)
   } else {
     ledcWrite(LEDC_CH_L, 0); ledcWrite(LEDC_CH_R, 0);   // STEP lines low: stop the step trains
     g_velCurL = g_velCurR = 0; g_velStartL = g_velStartR = 0;
     g_velFinalL = g_velFinalR = 0; g_actHzL = g_actHzR = 0; g_rampFrac = 1.0f;
     digitalWrite(PIN_TMC_EN, HIGH);             // disable outputs
-    drvL.toff(0); drvR.toff(0);                 // chopper off
+    drvL->toff(0); drvR->toff(0);               // chopper off
     digitalWrite(PIN_MOTOR_PWR, LOW);           // sleep: cut motor supply
   }
   g_motorsOn = on;
@@ -388,16 +431,17 @@ static inline bool wheelsMoving() {
   return (fabsf(g_velCurL) > 1.0f) || (fabsf(g_velCurR) > 1.0f);
 }
 
-// Set new wheel velocity targets from signed rpm and restart the shared ramp fraction at 0. The
-// right wheel is inverted for the back-to-back mount. Because both wheels interpolate from their
+// Set new wheel velocity targets from signed rpm and restart the shared ramp fraction at 0.
+// Because both wheels interpolate from their
 // start velocity to their final target on the SAME fraction, the L:R speed ratio is preserved for
 // the whole ramp (when starting from / ending at a stop, ratio == commanded ratio exactly).
-// Direction is the TMC shaft bit, set once here from the target sign (a stop keeps the last dir).
+// Direction is the TMC shaft bit, set once here from the target sign (a stop keeps the last dir);
+// g_revL/g_revR reverse a wheel for this cart's mounting.
 static void wheelSetTargets(float lRpm, float rRpm) {
-  float lHz = rpmToUstepsHz(lRpm);                          // signed µsteps/s
-  float rHz = rpmToUstepsHz(rRpm) * (WHEEL_R_INVERT ? -1.0f : 1.0f);
-  if (fabsf(lHz) > 0.5f) drvL.shaft(lHz < 0);               // shaft bit selects direction
-  if (fabsf(rHz) > 0.5f) drvR.shaft(rHz < 0);
+  float lHz = rpmToUstepsHz(lRpm) * (g_revL ? -1.0f : 1.0f);  // signed µsteps/s
+  float rHz = rpmToUstepsHz(rRpm) * (g_revR ? -1.0f : 1.0f);
+  if (fabsf(lHz) > 0.5f) drvL->shaft(lHz < 0);              // shaft bit selects direction
+  if (fabsf(rHz) > 0.5f) drvR->shaft(rHz < 0);
   g_velStartL = g_velCurL; g_velStartR = g_velCurR;
   g_velFinalL = lHz;       g_velFinalR = rHz;
   g_rampFrac  = 0.0f;
@@ -436,6 +480,7 @@ static void serviceRamp() {
     g_microsteps = g_pendingMicro;
     g_spread     = g_pendingSpread;
     g_interpolate = g_pendingInterp;
+    g_revL = g_pendingRevL; g_revR = g_pendingRevR;
     applyDriverParams();
     Serial.printf("params applied at standstill (usteps=%u); re-accelerating to L=%.0f R=%.0f rpm\n",
                   g_microsteps, g_pendingRpmL, g_pendingRpmR);
@@ -488,6 +533,32 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   g_cmdPending = true;
 }
 
+// Live Sun signal. The ESP-NOW receive callback on this core (IDF 4.4) carries no RSSI, so a
+// management-frame sniffer reads it off the Sun's own ESP-NOW frames (802.11 action frames, one
+// every ~2 s) and keeps a smoothed value. Runs in the Wi-Fi task, like onRecv.
+static void onSniff(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT || !g_sunKnown) return;
+  const wifi_promiscuous_pkt_t *p = (const wifi_promiscuous_pkt_t *)buf;
+  if (p->rx_ctrl.sig_len < 24 || p->payload[0] != 0xD0) return;   // 0xD0 = action frame
+  if (memcmp(p->payload + 10, g_sunMac, 6) != 0) return;           // addr2 = sender
+  int16_t r = (int16_t)(p->rx_ctrl.rssi * 16), q = g_rssiQ16;
+  g_rssiQ16 = q ? (int16_t)(q + (r - q) / 4) : r;
+}
+
+static void sniffEnable(bool on) {
+  if (on) {
+    wifi_promiscuous_filter_t f = {WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&f);
+    esp_wifi_set_promiscuous_rx_cb(onSniff);
+  }
+  esp_wifi_set_promiscuous(on);
+}
+
+static void rssiRefresh() {
+  int16_t q = g_rssiQ16;
+  if (q) g_sunRssi = (int8_t)lroundf(q / 16.0f);
+}
+
 // Apply the most recent command. Runs in loop() (main task). The Sun resends the active command
 // every ~2 s as a heartbeat, so this acts only on genuine changes.
 static void serviceCommand() {
@@ -505,13 +576,17 @@ static void serviceCommand() {
   uint16_t effUs = solarMicrostepsFromEnum(m.driver_cfg & 0x0F);
   bool spread = (m.driver_cfg & SOLAR_DRVCFG_CHOP)   != 0;
   bool interp = (m.driver_cfg & SOLAR_DRVCFG_INTERP) != 0;
+  bool revL   = (m.driver_cfg & SOLAR_DRVCFG_REV_L) != 0;
+  bool revR   = (m.driver_cfg & SOLAR_DRVCFG_REV_R) != 0;
   bool microChanged   = (effUs != g_microsteps);
   bool currentChanged = (m.current_ma != g_currentMa);
   bool chopChanged    = (spread != g_spread) || (interp != g_interpolate);
   bool paramsChanged  = microChanged || currentChanged || chopChanged;
+  bool revChanged     = (revL != g_revL) || (revR != g_revR);
 
   switch (m.command) {
     case CMD_STOP:
+      g_revL = revL; g_revR = revR;             // takes effect on the next start
       g_homingStop = false; g_resumePending = false;
       g_cmdWheelL = 0; g_cmdWheelR = 0;
       if (g_motorsOn) { g_stopThenOff = true; wheelSetTargets(0, 0); }  // decelerate, then power off
@@ -523,22 +598,26 @@ static void serviceCommand() {
       // Changing microsteps while turning would jump the speed; decelerate to a stop, apply the new
       // params at standstill, then re-accelerate (serviceRamp completes the sequence). Reliable with
       // LEDC — no step-generator restart involved. (Current/chopper/MicroPlyer alone don't jump the
-      // speed, so those are applied live below without stopping.)
-      if (microChanged && wheelsMoving()) {
-        Serial.printf("microsteps %u->%u while running: STOP, apply, then re-accelerate\n",
-                      g_microsteps, effUs);
+      // speed, so those are applied live below without stopping.) A wheel reversal goes the same
+      // way: flipping the shaft bit at speed would stall the motor.
+      if ((microChanged || revChanged) && wheelsMoving()) {
+        Serial.printf("microsteps %u->%u / reverse L%d R%d while running: STOP, apply, then re-accelerate\n",
+                      g_microsteps, effUs, revL, revR);
         g_resumePending = true;
         g_pendingMicro = effUs; g_pendingCurrent = m.current_ma;
         g_pendingSpread = spread; g_pendingInterp = interp;
+        g_pendingRevL = revL; g_pendingRevR = revR;
         g_pendingRpmL = m.wheel_l_rpm; g_pendingRpmR = m.wheel_r_rpm;
         wheelSetTargets(0, 0);
       } else if (!g_resumePending) {
         if (paramsChanged) driverParamsSet(m.current_ma, effUs, spread, interp);
+        g_revL = revL; g_revR = revR;
         bool wasOff = !g_motorsOn;
         if (wasOff) motorsEnable(true);
         // The Sun re-sends the same CMD_RUN every ~2 s as a heartbeat; only (re)start the ramp on a
         // genuine speed change (or a fresh enable), so an identical heartbeat doesn't reset it.
-        bool targetChanged = wasOff || (m.wheel_l_rpm != g_cmdWheelL) || (m.wheel_r_rpm != g_cmdWheelR);
+        bool targetChanged = wasOff || revChanged ||
+                             (m.wheel_l_rpm != g_cmdWheelL) || (m.wheel_r_rpm != g_cmdWheelR);
         g_cmdWheelL = m.wheel_l_rpm; g_cmdWheelR = m.wheel_r_rpm;
         if (targetChanged) wheelSetTargets(m.wheel_l_rpm, m.wheel_r_rpm);
       }
@@ -548,6 +627,7 @@ static void serviceCommand() {
     case CMD_HOME_AND_STOP:           // drive slowly toward HOME; homing logic stops on the pulse
       g_resumePending = false; g_stopThenOff = false;
       if (paramsChanged) driverParamsSet(m.current_ma, effUs, spread, interp);
+      g_revL = revL; g_revR = revR;             // homing is slow: a reversal can apply at once
       if (!g_homingStop) g_homeSeen = false;    // clear on entry only, not every heartbeat
       g_homingStop = true;
       if (!g_motorsOn) motorsEnable(true);
@@ -573,6 +653,7 @@ static void sendStatus() {
   s.moving       = wheelsMoving() ? 1 : 0;
   g_dieTempC     = readDieTempC();
   s.temp_c       = (int8_t)lroundf(constrain(g_dieTempC, -128.0f, 127.0f));
+  rssiRefresh();
   s.rssi         = g_sunRssi;
   s.cfg_ok       = g_cfgOk ? 1 : 0;
   s.fw_stamp     = g_fwStamp;
@@ -586,9 +667,11 @@ static void sendStatus() {
 }
 
 // Scan for the Sun's AP to discover its Wi-Fi channel, then lock onto it. Blocking (~2s);
-// only called at boot and while OFFLINE, so it never stalls active operation.
+// only called at boot and while OFFLINE, so it never stalls active operation. The live signal
+// reading restarts from the scan's value.
 static bool discoverChannel() {
   uint32_t t0 = millis();
+  sniffEnable(false);                     // scan with the sniffer off
   int n = WiFi.scanNetworks(false, true);
   int ch = -1;
   for (int i = 0; i < n; i++) {
@@ -599,11 +682,12 @@ static bool discoverChannel() {
     }
   }
   WiFi.scanDelete();
+  g_rssiQ16 = 0;
   Serial.printf("[%lu] LINK rescan: Sun on ch %d (%d dBm), took %lu ms\n", (unsigned long)millis(),
                 ch, g_sunRssi, (unsigned long)(millis() - t0));
-  if (ch < 0) return false;
-  esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
-  return true;
+  if (ch >= 0) esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE);
+  sniffEnable(true);
+  return ch >= 0;
 }
 
 // ----------------------------- Firmware update ------------------------------
@@ -848,6 +932,7 @@ void loop() {
   if (now - g_lastDbgMs > 2000) {
     g_lastDbgMs = now;
     g_dieTempC = readDieTempC();
+    rssiRefresh();
     const char *st = g_state == ST_OFFLINE ? "OFFLINE" : g_state == ST_IDLE ? "IDLE" : "ACTIVE";
     bool home = (digitalRead(PIN_HOME) == LOW);          // active-low sensor
     // Current wheel velocities and the equivalent rpm derived from the ACTUAL emitted LEDC step
@@ -857,13 +942,14 @@ void loop() {
     float rpmL = g_actHzL / (fullSteps * g_microsteps) * 60.0f * (g_velCurL < 0 ? -1 : 1);
     float rpmR = g_actHzR / (fullSteps * g_microsteps) * 60.0f * (g_velCurR < 0 ? -1 : 1);
     Serial.printf("[%lus] %s idx=%u sun=%d | signal=%d%%(%ddBm) temp=%.1fC home=%d | "
-                  "TMC:I=%umA usteps=%u %s%s cfg=%d | "
+                  "TMC:I=%umA usteps=%u %s%s cfg=%d rev=%s | "
                   "cmd L=%.0f R=%.0f rpm -> now L=%.0f R=%.0f rpm (%.0f/%.0f Hz) | "
                   "light=%d(%u%%) motors=%d\n",
                   (unsigned long)(now / 1000), st, g_myIndex, g_sunKnown ? 1 : 0,
                   rssiPct(g_sunRssi), g_sunRssi, g_dieTempC, home ? 1 : 0,
                   g_currentMa, g_microsteps,
                   g_spread ? "spread" : "stealth", g_interpolate ? " mplyer" : "", g_cfgOk ? 1 : 0,
+                  g_revL ? (g_revR ? "LR" : "L") : (g_revR ? "R" : "-"),
                   g_cmdWheelL, g_cmdWheelR, rpmL, rpmR, g_actHzL, g_actHzR,
                   g_lightOn ? 1 : 0, g_lightBrightness,
                   g_motorsOn ? 1 : 0);

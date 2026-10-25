@@ -210,7 +210,7 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
    :'<span class="'+(pl.ota===3?'er':!cf.present||pl.fw===cf.stamp?'ok':pl.fw<cf.stamp?'wa':'')+'"'+
     ' title="'+(pl.ota===3?'update failed, error '+pl.ota_err:!cf.present||pl.fw===cf.stamp?'up to date':
     pl.fw<cf.stamp?'older than the Sun\'s image: will update while idle':'newer than the Sun\'s image: left as is')+
-    '">'+fwtxt(pl.fw)+'</span>';
+    '">'+fwtxt(pl.fw)+(cf.present&&pl.fw>cf.stamp?' (newer)':'')+'</span>';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
    '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fw+'</td><td>'+fault+'</td></tr>';
  });
@@ -245,6 +245,15 @@ function mkInput(v,path){
 }
 const MICROSTEPS=[1,2,4,8,16,32,64,128,256];
 const CHOPPER=[['stealth','stealth (quiet)'],['spread','spread (normal)']];  // [value,label]
+const REVERSE=[['none','none'],['left','left wheel'],['right','right wheel'],['both','both (cart backwards)']];
+function perPlanet(title,val,path,mk){          // one labelled line per planet
+ const fs=document.createElement('fieldset');const lg=document.createElement('legend');
+ lg.textContent=title;fs.appendChild(lg);
+ val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
+  const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
+  f.appendChild(l);f.appendChild(mk(el,path.concat(i)));fs.appendChild(f);});
+ return fs;
+}
 function mkSelect(v,path,opts){                 // restrict a value to a fixed numeric option set
  const sel=document.createElement('select');
  opts.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=o;
@@ -271,23 +280,12 @@ function render(key,val,path){
   const l=document.createElement('label');l.textContent=key;
   f.appendChild(l);f.appendChild(mkSelectStr(val,path,CHOPPER));return f;
  }
- if(key==='mac_address'&&Array.isArray(val)){   // one labelled line per planet
-  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
-  lg.textContent=key;fs.appendChild(lg);
-  val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
-   const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
-   f.appendChild(l);f.appendChild(mkInput(el,path.concat(i)));fs.appendChild(f);});
-  return fs;
- }
- if(key==='light_brightness_per'&&Array.isArray(val)){  // per-planet light brightness, 0..100 %
-  const fs=document.createElement('fieldset');const lg=document.createElement('legend');
-  lg.textContent='light brightness (%)';fs.appendChild(lg);
-  val.forEach((el,i)=>{const f=document.createElement('div');f.className='f';
-   const l=document.createElement('label');l.textContent=(i+1)+'. '+(PLANETS[i]||('Planet '+(i+1)));
-   const inp=mkInput(el,path.concat(i));inp.min=0;inp.max=100;inp.step=1;
-   f.appendChild(l);f.appendChild(inp);fs.appendChild(f);});
-  return fs;
- }
+ if(key==='mac_address'&&Array.isArray(val))return perPlanet(key,val,path,mkInput);
+ if(key==='light_brightness_per'&&Array.isArray(val))   // per-planet light brightness, 0..100 %
+  return perPlanet('light brightness (%)',val,path,(v,p)=>{const inp=mkInput(v,p);
+   inp.min=0;inp.max=100;inp.step=1;return inp});
+ if(key==='reverse_per'&&Array.isArray(val))            // per-cart wheel direction (mounting/wiring)
+  return perPlanet('reverse wheel',val,path,(v,p)=>mkSelectStr(v,p,REVERSE));
  if(Array.isArray(val)){
   const fs=document.createElement('fieldset');const lg=document.createElement('legend');
   lg.textContent=key;fs.appendChild(lg);

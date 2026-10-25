@@ -68,6 +68,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
     "auto_update_firmware": true,
     "wheels": {
       "diameter_mm": 36,
+      "reverse_per": ["none","none","none","none","none","none","none","none"],
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
                    "chopper_mode": "stealth", "microplyer": true,
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
@@ -261,6 +262,13 @@ static void migrateSettings() {
     changed = true;
     Serial.println("Migrated settings: added planets.auto_update_firmware");
   }
+  JsonObject wheels = planets["wheels"].as<JsonObject>();
+  if (!wheels.isNull() && wheels["reverse_per"].isNull()) {
+    JsonArray rv = wheels["reverse_per"].to<JsonArray>();   // per-cart wheel reversal (was a build
+    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) rv.add("none");   // option on the cart)
+    changed = true;
+    Serial.println("Migrated settings: added planets.wheels.reverse_per");
+  }
   if (changed) saveSettings();
 }
 
@@ -373,13 +381,17 @@ static void sendCmd(int i, const CmdMsg &m) {
 }
 
 // ----------------------------- Speed model -----------------------------------
-// Pack the three per-move TMC params (microsteps / chopper / MicroPlyer) into the one byte the
-// planet decodes with solarMicrostepsFromEnum()/SOLAR_DRVCFG_*.
-static uint8_t packDriverCfg(JsonObject pl) {
+// Pack the three per-move TMC params (microsteps / chopper / MicroPlyer) and planet i's wheel
+// reversal ("none" / "left" / "right" / "both") into the one byte the planet decodes with
+// solarMicrostepsFromEnum()/SOLAR_DRVCFG_*.
+static uint8_t packDriverCfg(JsonObject pl, int i) {
   uint16_t ms   = pl["wheels"]["stepper"]["microsteps"] | 16;
   bool spread   = (String((const char *)(pl["wheels"]["stepper"]["chopper_mode"] | "stealth")) == "spread");
   bool interp   = (pl["wheels"]["stepper"]["microplyer"] | true);
-  return solarPackDriverCfg(ms, spread, interp);
+  String rev    = (const char *)(pl["wheels"]["reverse_per"][i] | "none");
+  return solarPackDriverCfg(ms, spread, interp) |
+         ((rev == "left"  || rev == "both") ? SOLAR_DRVCFG_REV_L : 0) |
+         ((rev == "right" || rev == "both") ? SOLAR_DRVCFG_REV_R : 0);
 }
 
 // Fill the CmdMsg light brightness for planet i from the settings "light_brightness_per" array.
@@ -431,7 +443,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   setCmdFw(m);
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
-  m.driver_cfg  = packDriverCfg(pl);
+  m.driver_cfg  = packDriverCfg(pl, i);
   return m;
 }
 
@@ -445,7 +457,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   setCmdFw(m);
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
-  m.driver_cfg  = packDriverCfg(pl);
+  m.driver_cfg  = packDriverCfg(pl, i);
   if (cmd == CMD_HOME_AND_STOP) {         // slow homing move, with differential
     float railW  = pl["rail"]["width_mm"]      | 70.0f;
     float outerD = pl["rail"]["outer_diameter_mm"][i] | 640.0f;
@@ -775,12 +787,12 @@ static void serviceCartFw() {
     PlanetState &p = g_planet[i];
     if (!g_macValid[i] || !p.lastSeenMs || msSince(p.lastSeenMs) > 5000) continue;
     if (p.otaState != lastState[i]) {
-      if (p.otaState == OTA_DOWNLOADING) addLog("Planet " + String(i) + ": downloading the new cart build");
-      if (p.otaState == OTA_FAILED)      addLog("Planet " + String(i) + ": update failed (error " + String(p.otaErr) + "), retrying in 1 min");
+      if (p.otaState == OTA_DOWNLOADING) addLog("Planet " + String(i + 1) + ": downloading the new cart build");
+      if (p.otaState == OTA_FAILED)      addLog("Planet " + String(i + 1) + ": update failed (error " + String(p.otaErr) + "), retrying in 1 min");
       lastState[i] = p.otaState;
     }
     if (p.fwStamp != lastStamp[i]) {
-      if (lastStamp[i]) addLog("Planet " + String(i) + ": now runs build " + fwStampText(p.fwStamp));
+      if (lastStamp[i]) addLog("Planet " + String(i + 1) + ": now runs build " + fwStampText(p.fwStamp));
       lastStamp[i] = p.fwStamp;
     }
   }
