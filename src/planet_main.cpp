@@ -146,7 +146,16 @@ static bool     g_pendingInterp  = true;
 static int8_t   g_sunRssi     = 0;         // Sun-AP RSSI (dBm) from the last channel scan
 static float    g_dieTempC    = 0;         // ESP32-C3 internal temperature (°C)
 
-static uint32_t g_lastCmdMs   = 0;         // last time a valid command arrived
+static volatile uint32_t g_lastCmdMs = 0;  // last time a valid command arrived (ESP-NOW callback)
+
+// Milliseconds since t. t is written by the ESP-NOW callback, which can run between our millis()
+// and our read of t, making t a hair newer than "now": count that as 0 rather than letting the
+// unsigned difference wrap to ~4e9 ("forever ago"). That wrap made a cart declare itself OFFLINE
+// right after a command and run a blocking 3-7 s rescan: the link drops every 1-3 minutes.
+static inline uint32_t msSince(uint32_t t) {
+  int32_t d = (int32_t)(millis() - t);
+  return d > 0 ? (uint32_t)d : 0;
+}
 static uint32_t g_nextStatusMs = 0;        // next scheduled status transmit
 static uint32_t g_channelScanMs = 0;       // last channel (re)scan while offline
 static uint32_t g_lastDbgMs   = 0;         // periodic debug heartbeat print
@@ -750,7 +759,7 @@ static void serviceLinkWatch() {
 
 // ----------------------------- State update ---------------------------------
 static void updateState() {
-  if (millis() - g_lastCmdMs > 5000) {
+  if (msSince(g_lastCmdMs) > 5000) {
     g_state = ST_OFFLINE;
   } else if (g_motorsOn || g_lightOn) {
     g_state = ST_ACTIVE;

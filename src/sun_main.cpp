@@ -95,7 +95,7 @@ static uint8_t g_planetMac[SOLAR_PLANET_COUNT][6];
 static bool    g_macValid[SOLAR_PLANET_COUNT];
 
 struct PlanetState {
-  uint32_t lastSeenMs;
+  volatile uint32_t lastSeenMs;   // set by the ESP-NOW callback: compare with msSince()
   uint8_t  error;
   bool     lightOn;
   bool     moving;
@@ -150,6 +150,14 @@ static String fmtUptime() {
   snprintf(buf, sizeof(buf), "%02u:%02u:%02u",
            (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
   return String(buf);
+}
+
+// Milliseconds since t, for timestamps the ESP-NOW callback writes (PlanetState.lastSeenMs): it can
+// land between our millis() and our read of t, so a "future" t counts as 0 instead of the unsigned
+// difference wrapping to ~4e9 (which would flag an online cart as gone).
+static inline uint32_t msSince(uint32_t t) {
+  int32_t d = (int32_t)(millis() - t);
+  return d > 0 ? (uint32_t)d : 0;
 }
 
 static void addLog(const String &s) {
@@ -731,10 +739,10 @@ static void serviceLinkWatch() {
     PlanetState &p = g_planet[i];
     if (!g_macValid[i] || !p.lastSeenMs) continue;
     uint32_t last = p.lastSeenMs;
-    if (!statusGap[i] && now - last > LINK_GAP_MS) {
+    if (!statusGap[i] && msSince(last) > LINK_GAP_MS) {
       statusGap[i] = true; gapFrom[i] = last;
       Serial.printf("[%lu] LINK p%d: no status for %lu ms (commands ACKed %lu, not %lu)\n",
-                    (unsigned long)now, i, (unsigned long)(now - last),
+                    (unsigned long)now, i, (unsigned long)msSince(last),
                     (unsigned long)p.txOk, (unsigned long)p.txFail);
     } else if (statusGap[i] && last != gapFrom[i]) {
       statusGap[i] = false;
@@ -765,7 +773,7 @@ static void serviceCartFw() {
   static uint32_t lastStamp[SOLAR_PLANET_COUNT];
   for (int i = 0; i < SOLAR_PLANET_COUNT; i++) {
     PlanetState &p = g_planet[i];
-    if (!g_macValid[i] || !p.lastSeenMs || millis() - p.lastSeenMs > 5000) continue;
+    if (!g_macValid[i] || !p.lastSeenMs || msSince(p.lastSeenMs) > 5000) continue;
     if (p.otaState != lastState[i]) {
       if (p.otaState == OTA_DOWNLOADING) addLog("Planet " + String(i) + ": downloading the new cart build");
       if (p.otaState == OTA_FAILED)      addLog("Planet " + String(i) + ": update failed (error " + String(p.otaErr) + "), retrying in 1 min");
@@ -883,7 +891,7 @@ static void buildStatusJson(String &out) {
   for (int i = 0; i < SOLAR_PLANET_COUNT; i++) {
     JsonObject o = arr.add<JsonObject>();
     bool online = g_macValid[i] && g_planet[i].lastSeenMs &&
-                  (millis() - g_planet[i].lastSeenMs < 5000);
+                  (msSince(g_planet[i].lastSeenMs) < 5000);
     o["online"]      = online;
     o["configured"]  = g_macValid[i];
     o["moving"]      = g_planet[i].moving;
