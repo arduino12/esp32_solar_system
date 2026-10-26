@@ -19,12 +19,22 @@
 #include <AsyncJson.h>
 #include <ElegantOTA.h>
 #include <MD5Builder.h>
+#include <Update.h>
 
 #define FASTLED_INTERNAL
 #include <FastLED.h>
 
 #include "solar_protocol.h"
 #include "sun_web_ui.h"
+
+// Build stamp (UTC Unix seconds) and the marker that identifies a Sun image to the page's
+// "Firmware Update" (see sunFwUploadChunk).
+#ifndef SOLAR_FW_BUILD_UTC
+#error "SOLAR_FW_BUILD_UTC is set by scripts/fw_build_stamp.py (extra_scripts in platformio.ini)"
+#endif
+#define FW_STR2(x) #x
+#define FW_STR(x) FW_STR2(x)
+static const char SUN_FW_ID[] = SOLAR_SUN_FW_MARK FW_STR(SOLAR_FW_BUILD_UTC);
 
 // ----------------------------- Pin map (from spec) --------------------------
 static const uint8_t PIN_LED         = 14;  // WS2812 data
@@ -68,7 +78,7 @@ static const char DEFAULT_SETTINGS_JSON[] PROGMEM = R"JSON({
     "auto_update_firmware": true,
     "wheels": {
       "diameter_mm": 36,
-      "reverse_per": ["none","none","none","none","none","none","none","none"],
+      "reverse_per": ["right","right","right","right","right","right","right","right"],
       "stepper": { "current_amp": 0.2, "microsteps": 16, "step_degree": 1.8,
                    "chopper_mode": "stealth", "microplyer": true,
                    "max_speed_rpm": [500,500,500,500,500,500,500,500] }
@@ -111,8 +121,18 @@ struct PlanetState {
   int16_t  otaErr;        // reason for OTA_FAILED
   uint32_t txOk, txFail;  // ESP-NOW unicasts to this cart that were / weren't ACKed by its radio
   uint8_t  txFailRun;     // consecutive unACKed unicasts
+  bool     fwForce;       // install the Sun's cart image even if not newer (pushed from the page)
 };
 static PlanetState g_planet[SOLAR_PLANET_COUNT];
+
+// Carts heard that aren't in planets.mac_address (e.g. a freshly flashed C3, which broadcasts its
+// status until a Sun commands it), listed on the page so they can be added to a slot. Written by
+// the ESP-NOW callback, read by the web task: copy under g_newMux.
+#define NEW_CART_N       8
+#define NEW_CART_KEEP_MS 20000      // unprovisioned carts rescan for the Sun's channel every 10 s
+struct NewCart { uint8_t mac[6]; uint32_t lastSeenMs; int8_t rssi; uint32_t fwStamp; };
+static NewCart     g_newCart[NEW_CART_N];
+static portMUX_TYPE g_newMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Cart firmware image, LittleFS CART_FW_PATH (see "Cart firmware update" below), and the chunk
 // requests the ESP-NOW callback queues for loop() to answer.
@@ -265,7 +285,7 @@ static void migrateSettings() {
   JsonObject wheels = planets["wheels"].as<JsonObject>();
   if (!wheels.isNull() && wheels["reverse_per"].isNull()) {
     JsonArray rv = wheels["reverse_per"].to<JsonArray>();   // per-cart wheel reversal (was a build
-    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) rv.add("none");   // option on the cart)
+    for (int k = 0; k < SOLAR_PLANET_COUNT; k++) rv.add("right");  // option on the cart)
     changed = true;
     Serial.println("Migrated settings: added planets.wheels.reverse_per");
   }
@@ -323,6 +343,26 @@ static int planetByMac(const uint8_t *mac) {
   return -1;
 }
 
+// A status from a MAC that isn't in the planet list: remember it (refresh its entry, else take the
+// stalest one). Its signal and build are filled in when the message is the full current StatusMsg.
+static void noteNewCart(const uint8_t *mac, const uint8_t *data, int len) {
+  const StatusMsg *s = len >= (int)sizeof(StatusMsg) ? (const StatusMsg *)data : nullptr;
+  portENTER_CRITICAL(&g_newMux);
+  int slot = -1, stalest = 0;
+  for (int k = 0; k < NEW_CART_N; k++) {
+    const NewCart &e = g_newCart[k];
+    if (e.lastSeenMs && memcmp(e.mac, mac, 6) == 0) { slot = k; break; }
+    if (!g_newCart[stalest].lastSeenMs) continue;             // already found an empty entry
+    if (!e.lastSeenMs || msSince(e.lastSeenMs) > msSince(g_newCart[stalest].lastSeenMs)) stalest = k;
+  }
+  if (slot < 0) slot = stalest;
+  NewCart &c = g_newCart[slot];
+  if (memcmp(c.mac, mac, 6) != 0) { memcpy(c.mac, mac, 6); c.rssi = 0; c.fwStamp = 0; }
+  c.lastSeenMs = millis();
+  if (s) { c.rssi = s->rssi; c.fwStamp = s->fw_stamp; }
+  portEXIT_CRITICAL(&g_newMux);
+}
+
 static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len < 2 || data[0] != SOLAR_MAGIC) return;
   if (data[1] == SOLAR_MSG_FW_REQ) {                   // a cart wants image bytes: loop() answers
@@ -335,13 +375,11 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
     g_fwReqHead = next;
     return;
   }
-  if (data[1] != SOLAR_MSG_STATUS || len < (int)sizeof(StatusMsg)) return;
-  StatusMsg s; memcpy(&s, data, sizeof(s));
-
+  if (data[1] != SOLAR_MSG_STATUS) return;
   int idx = planetByMac(mac);
-  if (idx < 0 && s.planet_index < SOLAR_PLANET_COUNT)  // fall back to echoed index
-    idx = s.planet_index;
-  if (idx < 0) return;
+  if (idx < 0) { noteNewCart(mac, data, len); return; }   // not ours (yet): list it on the page
+  if (len < (int)sizeof(StatusMsg)) return;
+  StatusMsg s; memcpy(&s, data, sizeof(s));
 
   PlanetState &p = g_planet[idx];
   p.lastSeenMs = millis();
@@ -350,7 +388,7 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len) {
   p.tempC      = s.temp_c;
   p.rssi       = s.rssi;
   if (!s.cfg_ok && p.cfgOk)             // config verification just failed on the cart
-    addLog("Planet " + String(idx) + " driver cfg UNVERIFIED (UART)");
+    addLog("Planet " + String(idx + 1) + " driver cfg UNVERIFIED (UART)");
   p.cfgOk      = s.cfg_ok;
   if (s.home_pulsed) p.homeCount++;
   p.error = s.error;                    // always ERR_NONE now (fault sensing removed)
@@ -400,14 +438,17 @@ static void setCmdLight(CmdMsg &m, int i) {
   m.light_brightness = (uint8_t)lroundf(constrain(pct, 0.0f, 100.0f));
 }
 
-// Offer the cart image in the command: only while IDLE with auto-update on. Otherwise fw_stamp
-// stays 0 and a cart that is downloading pauses until it is offered again.
-static void setCmdFw(CmdMsg &m) {
+// Offer the cart image in planet i's command: only while IDLE, with auto-update on or the image
+// pushed to the carts from the page (then forced: installed even over a newer build). Otherwise
+// fw_stamp stays 0 and a cart that is downloading pauses until it is offered again.
+static void setCmdFw(CmdMsg &m, int i) {
   bool autoUpdate = g_settings["planets"]["auto_update_firmware"] | true;
-  if (!g_fw.present || !autoUpdate || g_mode != MODE_IDLE) return;
+  bool force = g_planet[i].fwForce;
+  if (!g_fw.present || !(autoUpdate || force) || g_mode != MODE_IDLE) return;
   m.fw_stamp = g_fw.stamp;
   m.fw_size  = g_fw.size;
   memcpy(m.fw_md5, g_fw.md5, sizeof(m.fw_md5));
+  if (force) m.fw_flags |= SOLAR_FW_FORCE;
 }
 
 // Given the per-rail OUTER wheel speed, compute the two wheel speeds so the cart rolls around the
@@ -440,7 +481,7 @@ static CmdMsg buildRunCmd(int i, bool light) {
   m.wheel_r_rpm = wheelR * sign;
   m.light_on    = light ? 1 : 0;
   setCmdLight(m, i);
-  setCmdFw(m);
+  setCmdFw(m, i);
   m.current_ma  = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl, i);
@@ -454,7 +495,7 @@ static CmdMsg buildSimpleCmd(int i, PlanetCmd cmd, bool light) {
   m.command    = cmd;
   m.light_on   = light ? 1 : 0;
   setCmdLight(m, i);
-  setCmdFw(m);
+  setCmdFw(m, i);
   m.current_ma = (uint16_t)((pl["wheels"]["stepper"]["current_amp"] | 0.2f) * 1000.0f);
   m.step_degree = pl["wheels"]["stepper"]["step_degree"] | 1.8f;
   m.driver_cfg  = packDriverCfg(pl, i);
@@ -705,6 +746,61 @@ static void fwUploadChunk(AsyncWebServerRequest *req, const String &name, size_t
   g_fwUploaded = true;
 }
 
+// The page's "Firmware Update" with no file chosen: every cart installs the stored image, even
+// over a newer build (PlanetState.fwForce, cleared once the cart runs it). Handled in loop().
+static volatile bool g_fwPushReq = false;
+
+// One step of a streaming search for marker mk (n = characters matched so far). On a mismatch it
+// falls back to the longest prefix of mk that still ends here: SOLAR_SUN_FW_MARK repeats its
+// first letter, so a plain restart could miss a match that begins inside a partial one.
+static uint8_t markStep(const char *mk, uint8_t n, char c) {
+  while (true) {
+    if (c == mk[n]) return n + 1;
+    if (n == 0) return 0;
+    uint8_t k = n - 1;                                 // longest border of mk[0..n)
+    while (k && memcmp(mk, mk + n - k, k) != 0) k--;
+    n = k;
+  }
+}
+
+// The Sun's own firmware (POST /api/sun_fw) streams straight into the other OTA slot. Accepted
+// only as an ESP32 image that carries SOLAR_SUN_FW_MARK, so another project's firmware can't
+// replace the Sun's; Update.end() then verifies the image and switches the boot slot, and loop()
+// restarts the Sun once the reply has gone out.
+static String   g_sunUpErr;
+static uint8_t  g_sunUpMk = 0;                 // marker characters matched so far
+static bool     g_sunUpDone = false;           // the last chunk arrived
+static volatile uint32_t g_restartAtMs = 0;    // restart into the new firmware at this time
+
+static void sunFwUploadChunk(AsyncWebServerRequest *req, const String &name, size_t index,
+                             uint8_t *data, size_t len, bool final) {
+  static const char MK[] = SOLAR_SUN_FW_MARK;
+  const uint8_t mkLen = sizeof(MK) - 1;
+  if (index == 0) {
+    g_sunUpErr = ""; g_sunUpMk = 0; g_sunUpDone = false;
+    if (Update.isRunning()) Update.abort();            // an earlier upload that broke off
+    if (len < 24 || data[0] != 0xE9 || (data[12] | (data[13] << 8)) != 0) {
+      g_sunUpErr = "not an ESP32 firmware image";
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      g_sunUpErr = String("cannot start the update: ") + Update.errorString();
+      return;
+    }
+  }
+  if (!g_sunUpErr.isEmpty()) return;
+  for (size_t k = 0; k < len && g_sunUpMk < mkLen; k++) g_sunUpMk = markStep(MK, g_sunUpMk, (char)data[k]);
+  if (Update.write(data, len) != len) {
+    g_sunUpErr = String("flash write failed: ") + Update.errorString();
+    Update.abort();
+    return;
+  }
+  if (!final) return;
+  g_sunUpDone = true;
+  if (g_sunUpMk < mkLen) { Update.abort(); g_sunUpErr = "not a Solar System Sun firmware"; return; }
+  if (!Update.end(true)) g_sunUpErr = String("image rejected: ") + Update.errorString();
+}
+
 // Answer queued chunk requests from the image file (at most 8 chunks per request).
 static void serviceFwRequests() {
   if (g_fwReqTail == g_fwReqHead) return;
@@ -729,7 +825,6 @@ static void serviceFwRequests() {
   xSemaphoreGive(g_fwLock);
 }
 
-// Uploads and each cart's download progress, for the web log.
 // ----------------------------- Link watch ------------------------------------
 // ESP-NOW unicasts are ACKed by the receiving radio, so onSent() counts per cart which commands
 // arrived. serviceLinkWatch() logs (serial) when a cart stops ACKing or stops sending status for
@@ -773,12 +868,21 @@ static void serviceLinkWatch() {
   }
 }
 
+// Uploads, pushes and each cart's download progress, for the web log.
 static void serviceCartFw() {
   if (g_fwUploaded) {
     g_fwUploaded = false;
+    for (auto &p : g_planet) p.fwForce = false;        // a push was for the previous image
     addLog(g_fw.present ? "Cart firmware uploaded: build " + fwStampText(g_fw.stamp) + " (" +
                           String(g_fw.size / 1024) + " KB)"
                         : "Cart firmware upload rejected: " + g_upErr);
+  }
+  if (g_fwPushReq && g_fw.present) {
+    g_fwPushReq = false;
+    int n = 0;
+    for (int i = 0; i < SOLAR_PLANET_COUNT; i++)
+      if (g_macValid[i] && g_planet[i].fwStamp != g_fw.stamp) { g_planet[i].fwForce = true; n++; }
+    addLog("Cart firmware pushed: " + String(n) + " cart(s) will install build " + fwStampText(g_fw.stamp));
   }
   serviceFwRequests();
   static uint8_t  lastState[SOLAR_PLANET_COUNT];
@@ -795,6 +899,7 @@ static void serviceCartFw() {
       if (lastStamp[i]) addLog("Planet " + String(i + 1) + ": now runs build " + fwStampText(p.fwStamp));
       lastStamp[i] = p.fwStamp;
     }
+    if (p.fwForce && g_fw.present && p.fwStamp == g_fw.stamp) p.fwForce = false;   // push done
   }
 }
 
@@ -922,15 +1027,34 @@ static void buildStatusJson(String &out) {
       o["ota"]      = g_planet[i].otaState;      // OtaState: download progress / result
       o["ota_pct"]  = g_planet[i].otaProgress;
       o["ota_err"]  = g_planet[i].otaErr;
+      o["fw_force"] = g_planet[i].fwForce;       // pushed: installs the Sun's image even if newer
     }
     o["tx_ok"]   = g_planet[i].txOk;           // commands ACKed / not ACKed by the cart's radio
     o["tx_fail"] = g_planet[i].txFail;
+  }
+
+  // Carts heard recently that aren't in the planet list (to add a freshly flashed C3).
+  NewCart nc[NEW_CART_N];
+  portENTER_CRITICAL(&g_newMux);
+  memcpy(nc, g_newCart, sizeof(nc));
+  portEXIT_CRITICAL(&g_newMux);
+  JsonArray na = d["new_carts"].to<JsonArray>();
+  for (const NewCart &c : nc) {
+    if (!c.lastSeenMs || msSince(c.lastSeenMs) > NEW_CART_KEEP_MS || planetByMac(c.mac) >= 0) continue;
+    char mac[18];
+    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             c.mac[0], c.mac[1], c.mac[2], c.mac[3], c.mac[4], c.mac[5]);
+    JsonObject o = na.add<JsonObject>();
+    o["mac"]  = mac;
+    o["rssi"] = c.rssi;
+    o["fw"]   = c.fwStamp;
   }
 
   JsonObject fw = d["cart_fw"].to<JsonObject>();
   fw["present"] = g_fw.present;
   fw["auto"]    = g_settings["planets"]["auto_update_firmware"] | true;
   if (g_fw.present) { fw["stamp"] = g_fw.stamp; fw["size"] = g_fw.size; }
+  d["sun_fw"] = (uint32_t)SOLAR_FW_BUILD_UTC;
 
   JsonObject net = d["net"].to<JsonObject>();
   net["ap_ip"]  = WiFi.softAPIP().toString();
@@ -1006,6 +1130,28 @@ static void setupWeb() {
     req->send(200, "application/json", s);
   }, fwUploadChunk);
 
+  // Push the stored cart image to every cart, newer builds included; applied in loop().
+  server.on("/api/cart_fw_push", HTTP_POST, [](AsyncWebServerRequest *req) {
+    if (!g_fw.present) {
+      req->send(200, "application/json", "{\"ok\":false,\"error\":\"no cart firmware stored on the Sun\"}");
+      return;
+    }
+    g_fwPushReq = true;
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // The Sun's own firmware (multipart .bin): installed into the other slot, then the Sun restarts.
+  server.on("/api/sun_fw", HTTP_POST, [](AsyncWebServerRequest *req) {
+    bool ok = g_sunUpDone && g_sunUpErr.isEmpty();
+    JsonDocument d;
+    d["ok"] = ok;
+    if (!ok) d["error"] = g_sunUpErr.isEmpty() ? String("no firmware received") : g_sunUpErr;
+    g_sunUpDone = false;
+    String s; serializeJson(d, s);
+    req->send(200, "application/json", s);
+    if (ok) g_restartAtMs = millis() + 1500;
+  }, sunFwUploadChunk);
+
   ElegantOTA.begin(&server);
   server.begin();
 }
@@ -1059,6 +1205,7 @@ void setup() {
   loadCartFw();
 
   Serial.println("\n==== Solar System — SUN boot ====");
+  Serial.printf("Firmware %s = %s\n", SUN_FW_ID, fwStampText(SOLAR_FW_BUILD_UTC).c_str());
   dumpFileToSerial("/settings.json");
   dumpFileToSerial("/stats.json");
   if (g_fw.present) Serial.printf("Cart firmware: build %s, %lu bytes\n", fwStampText(g_fw.stamp).c_str(), (unsigned long)g_fw.size);
@@ -1101,4 +1248,10 @@ void loop() {
   if (g_reloadSettings) { g_reloadSettings = false; applyPendingSettings(); }
   if (g_pendingAction.length()) applyPendingAction();
   if (g_doFactoryReset) { g_doFactoryReset = false; doFactoryReset(); }
+  if (g_restartAtMs && (int32_t)(millis() - g_restartAtMs) >= 0) {   // new Sun firmware installed
+    Serial.println("Sun firmware updated: restarting");
+    enterMode(MODE_IDLE);                  // stop the carts first
+    delay(200);
+    ESP.restart();
+  }
 }

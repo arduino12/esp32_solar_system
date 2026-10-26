@@ -87,7 +87,9 @@ struct __attribute__((packed)) CmdMsg {
   uint32_t fw_stamp;      // build stamp of the Sun's cart image (UTC Unix seconds)
   uint32_t fw_size;       // image length, bytes
   uint8_t  fw_md5[16];    // MD5 of the image; the cart verifies it before booting into it
-};
+  uint8_t  fw_flags;      // SOLAR_FW_FORCE: install the offered image even if it isn't newer
+};                        // (appended last: carts built before it accept the longer message)
+#define SOLAR_FW_FORCE 0x01   // set per cart when the Sun's page pushes its stored cart image
 
 // ------------------------ Cart firmware update ------------------------------
 // The Sun keeps the last uploaded cart image (LittleFS) and offers it in every CmdMsg. A cart
@@ -101,6 +103,9 @@ struct __attribute__((packed)) CmdMsg {
 // followed by the stamp as 10 decimal digits; the Sun reads it out of an uploaded image.
 #define SOLAR_FW_MARK      "SOLAR-PLANET-FW "
 #define SOLAR_FW_STAMP_LEN 10                        // decimal digits of the Unix time
+// The Sun's own firmware carries SOLAR_SUN_FW_MARK + its stamp the same way, so the Sun's page
+// only installs a Sun build on the Sun (not some other ESP32 project's firmware).
+#define SOLAR_SUN_FW_MARK  "SOLAR-SUN-FW "
 
 static inline uint32_t solarFwStamp(const char *digits) {   // the 10 digits after SOLAR_FW_MARK
   uint32_t v = 0;

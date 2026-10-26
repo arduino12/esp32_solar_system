@@ -193,6 +193,7 @@ static uint32_t g_selfTestEndMs = 0;
 
 static uint32_t  g_offerStamp = 0, g_offerSize = 0;    // image on offer, from the latest CmdMsg
 static uint8_t   g_offerMd5[16];
+static bool      g_offerForce = false;                  // install it even if it isn't newer
 static FwDataMsg g_fwRxq[FW_RXQ];
 static volatile uint8_t g_fwRxHead = 0, g_fwRxTail = 0;
 static bool      g_dlActive = false;
@@ -569,6 +570,7 @@ static void serviceCommand() {
   g_myIndex = m.planet_index;
   if (m.step_degree > 0.01f) g_stepDegree = m.step_degree;
   g_offerStamp = m.fw_stamp; g_offerSize = m.fw_size;   // cart image on offer (0 = none / paused)
+  g_offerForce = (m.fw_flags & SOLAR_FW_FORCE) != 0;
   memcpy(g_offerMd5, m.fw_md5, sizeof(g_offerMd5));
   lightSetBrightness(m.light_brightness);           // per-planet brightness chosen on the Sun
 
@@ -715,8 +717,10 @@ static void fwStop(uint8_t state, int16_t err) {      // OTA_IDLE = abandoned, O
 
 static void serviceFwDownload() {
   uint32_t now = millis();
-  // Only ever move to a NEWER build: a cart flashed with something newer (USB, testing) stays put.
-  bool offered = g_offerStamp > g_fwStamp && g_sunKnown && !g_motorsOn && !g_selfTest;
+  // Only ever move to a NEWER build: a cart flashed with something newer (USB, testing) stays put,
+  // unless the Sun's page pushed its image to the carts (forced).
+  bool wanted  = g_offerStamp > g_fwStamp || (g_offerForce && g_offerStamp && g_offerStamp != g_fwStamp);
+  bool offered = wanted && g_sunKnown && !g_motorsOn && !g_selfTest;
   if (!g_dlActive) {
     g_fwRxTail = g_fwRxHead;                            // drop stray chunks
     if (!offered) return;

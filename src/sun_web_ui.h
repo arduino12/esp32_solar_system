@@ -59,7 +59,17 @@ input:focus,select:focus{outline:none;border-color:var(--acc)}
 .toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#1f6feb;color:#fff;
 padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
 .toast.on{opacity:1}
+.offline{display:none;position:fixed;top:0;left:0;right:0;z-index:10;background:var(--red);color:#fff;
+font-weight:700;text-align:center;padding:12px 16px;box-shadow:0 2px 12px #000a}
+body.off .offline{display:block}
+body.off .wrap{filter:grayscale(1);opacity:.35;pointer-events:none;user-select:none}
+.nc{margin-top:12px;padding:8px 10px;border:1px dashed var(--acc);border-radius:8px;font-size:13px}
+.nc .h{color:var(--acc);font-weight:600}
+.nc .r{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+.nc code{font:12px ui-monospace,Consolas,monospace;color:var(--tx)}.nc .m{color:var(--mut);font-size:12px}
+.b-add{background:var(--grn);padding:6px 14px;font-size:13px}
 </style></head><body>
+<div class="offline" id="offline"></div>
 <div class="wrap">
 <h1>Solar System</h1>
 
@@ -72,6 +82,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <div><span>STA&nbsp;IP:</span> <a id="n_sta" target="_blank" rel="noopener">--</a></div>
 <div><span>AP&nbsp;IP:</span> <b id="n_ap">--</b></div>
 <div><span>mDNS:</span> <a id="n_mdns" target="_blank" rel="noopener">--</a></div>
+<div><span>Sun&nbsp;build:</span> <b id="n_fw">--</b></div>
 </div></div>
 
 <div class="card"><h2>Status</h2>
@@ -80,6 +91,7 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 <svg viewBox="0 0 400 400" id="sky"></svg>
 <table class="ptab"><thead><tr><th>Planet</th><th>State</th><th>Signal</th><th>Temp</th><th>Cfg</th><th>FW</th><th>Fault</th></tr></thead>
 <tbody id="ptab"></tbody></table>
+<div id="newcarts"></div>
 <div id="log"></div>
 </div>
 
@@ -92,16 +104,19 @@ padding:10px 18px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none
 </div>
 </div>
 
-<div class="card"><h2>Cart firmware</h2>
+<div class="card"><h2>Firmware</h2>
 <div class="mode" id="fw_info">--</div>
-<div class="row" style="margin-top:10px;align-items:center">
-<input type="file" id="fw_file" accept=".bin" style="flex:1;min-width:0">
-<button class="b-test" onclick="fwUpload()">Upload</button>
+<div class="row" style="margin-top:10px">
+<button class="b-test" onclick="fwPick()">Firmware Update</button>
+<input type="file" id="fw_file" accept=".bin" hidden>
 </div>
-<div class="mode" style="margin-top:8px">Upload .pio/build/solar_planet_esp32c3/firmware.bin. While the show is
-idle, every cart running an older build downloads it from the Sun (all at once), checks it and reboots;
-a cart flashed with a newer build (e.g. over USB) is left as is.
-A show pauses the downloads. Turn off planets &rsaquo; auto_update_firmware in Settings to hold the carts.</div>
+<div class="mode" style="margin-top:8px">Pick a firmware.bin. A <b>cart</b> build
+(.pio/build/solar_planet_esp32c3) is stored on the Sun; while the show is idle, every cart on an
+older build downloads it (all at once), checks it and reboots, and a cart flashed with a newer build
+(e.g. over USB) is left as is. A <b>Sun</b> build (.pio/build/solar_sun_esp32) is installed on the
+Sun, which then restarts. Close the file dialog without a file to install the stored cart build on
+every cart, newer ones included. A show pauses the downloads; turn off
+planets &rsaquo; auto_update_firmware in Settings to hold the carts.</div>
 </div>
 
 <div class="card"><h2>Settings</h2>
@@ -119,7 +134,8 @@ A show pauses the downloads. Turn off planets &rsaquo; auto_update_firmware in S
 const $=s=>document.querySelector(s);
 const COLORS=['#f4d35e','#e07a5f','#81b29a','#5f9ea0','#c77dff','#6ca6ff','#f28482','#b5e48c'];
 const PLANETS=['Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune'];
-function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),1600)}
+function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');
+ clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('on'),1600+m.length*25)}
 function setLink(a,ip,fallback){if(ip){a.textContent=ip;a.href='http://'+ip+'/';}
  else{a.textContent=fallback;a.removeAttribute('href');}}
 function hms(s){s=Math.max(0,s|0);const h=String(s/3600|0).padStart(2,'0'),
@@ -131,7 +147,7 @@ body:JSON.stringify({action:a})}).then(()=>toast(a))}
 function resetStats(){if(confirm('Reset both statistics counters to zero?'))
 fetch('/api/stats/reset',{method:'POST'}).then(()=>{toast('reset');loadStats()})}
 function loadStats(){fetch('/api/stats').then(r=>r.json()).then(d=>{
-$('#st_trig').textContent=d.presses_triggered;$('#st_ign').textContent=d.presses_ignored})}
+$('#st_trig').textContent=d.presses_triggered;$('#st_ign').textContent=d.presses_ignored}).catch(()=>{})}
 
 /* ---- solar-system diagram ---- */
 const SVGNS='http://www.w3.org/2000/svg',CX=200,CY=200,N=8;
@@ -182,16 +198,29 @@ function anim(t){
  requestAnimationFrame(anim);
 }
 
-/* ---- status poll ---- */
-function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
+/* ---- status poll; two misses in a row (no answer within 3 s) = the Sun is unreachable ---- */
+let fails=0;
+function setOffline(off){const b=$('#offline');
+ if(off)b.textContent=sunUpdating?'The Sun is restarting with its new firmware…':
+  'No connection to the Sun. Reconnect to the '+((cfg&&cfg.wifi&&cfg.wifi.ap_ssid)||'SolarSystem')+' Wi-Fi.';
+ document.body.classList.toggle('off',off)}
+function poll(){const ac=new AbortController(),to=setTimeout(()=>ac.abort(),3000);
+ fetch('/api/status',{signal:ac.signal,cache:'no-store'}).then(r=>r.json()).then(d=>{
+  const back=fails>=2;fails=0;
+  if(sunUpdating&&(back||d.sun_fw!==sunUpdating)){location.reload();return}  // load the new page
+  setOffline(false);show(d)})
+ .catch(()=>{if(++fails>=2)setOffline(true)})
+ .finally(()=>{clearTimeout(to);setTimeout(poll,1000)})}
+function show(d){
  $('#mode').textContent='Mode: '+d.mode;
  $('#timer').textContent=hms(d.countdown?d.phase_remaining_s:d.phase_elapsed_s);
  if(d.net){setLink($('#n_sta'),d.net.sta_ip,'not connected');
   $('#n_ap').textContent=d.net.ap_ip||'--';
   setLink($('#n_mdns'),d.net.mdns,'--');}
+ sunFw=d.sun_fw||0;$('#n_fw').textContent=sunFw?fwtxt(sunFw,1):'--';
  const ERRTXT=['','motor disconnected','motor stuck'];let rows='';
- const cf=d.cart_fw||{};
- if(!fwBusy)$('#fw_info').textContent=cf.present?('On the Sun: build '+fwtxt(cf.stamp,1)+' · '+
+ const cf=lastCf=d.cart_fw||{};
+ if(!fwBusy)$('#fw_info').textContent=cf.present?('Cart firmware on the Sun: build '+fwtxt(cf.stamp,1)+' · '+
   Math.round(cf.size/1024)+' KB · auto-update '+(cf.auto?'on':'OFF')):'No cart firmware uploaded to the Sun yet.';
  d.planets.forEach((pl,i)=>{const p=view[i];if(!p)return;
   p.color=COLORS[i];p.online=pl.online;p.light=pl.light_on;p.error=pl.error;
@@ -207,30 +236,79 @@ function poll(){fetch('/api/status').then(r=>r.json()).then(d=>{
   let fw='—';                                   // build; download progress / result while updating
   if(pl.online)fw=pl.ota===1?'<span class="wa">&darr; '+pl.ota_pct+'%</span>'
    :pl.ota===2?'<span class="wa">rebooting…</span>'
-   :'<span class="'+(pl.ota===3?'er':!cf.present||pl.fw===cf.stamp?'ok':pl.fw<cf.stamp?'wa':'')+'"'+
+   :'<span class="'+(pl.ota===3?'er':!cf.present||pl.fw===cf.stamp?'ok':pl.fw<cf.stamp||pl.fw_force?'wa':'')+'"'+
     ' title="'+(pl.ota===3?'update failed, error '+pl.ota_err:!cf.present||pl.fw===cf.stamp?'up to date':
+    pl.fw_force?'pushed from this page: installs the Sun\'s image while idle':
     pl.fw<cf.stamp?'older than the Sun\'s image: will update while idle':'newer than the Sun\'s image: left as is')+
     '">'+fwtxt(pl.fw)+(cf.present&&pl.fw>cf.stamp?' (newer)':'')+'</span>';
   rows+='<tr class="'+(pl.online?'':'off')+'"><td>'+dot+(PLANETS[i]||('P'+(i+1)))+
    '</td><td>'+state+'</td><td>'+sig+'</td><td>'+temp+'</td><td>'+cfg+'</td><td>'+fw+'</td><td>'+fault+'</td></tr>';
  });
  $('#ptab').innerHTML=rows;
+ newCarts(d.new_carts||[],d.planets);
  $('#log').textContent=(d.log||[]).join('\n');
-}).catch(()=>{})}
+}
 
-/* ---- cart firmware (OTA) ---- */
+/* ---- carts the Sun hears that aren't in the planet list: add one to a slot ---- */
+let ncKey='';
+function newCarts(nc,planets){
+ const key=nc.map(c=>c.mac).join()+'|'+planets.map(p=>p.configured?1:0).join('');
+ if(key!==ncKey){ncKey=key;             // rebuild only on change, so a slot choice isn't reset
+  if(!nc.length){$('#newcarts').innerHTML='';return}
+  const free=planets.findIndex(p=>!p.configured);
+  let h='<div class="nc"><div class="h">New carts nearby, not in the planet list</div>';
+  nc.forEach((c,k)=>{let o='';
+   PLANETS.forEach((n,i)=>{o+='<option value="'+i+'"'+(i===free?' selected':'')+'>'+(i+1)+'. '+n+
+    (planets[i]&&planets[i].configured?' (replace)':'')+'</option>'});
+   h+='<div class="r"><code>'+c.mac+'</code><span class="m" id="nc_i'+k+'"></span>'+
+    '<select id="nc_s'+k+'">'+o+'</select><button class="b-add" onclick="ncAdd(\''+c.mac+'\','+k+')">Add</button></div>'});
+  $('#newcarts').innerHTML=h+'</div>'}
+ nc.forEach((c,k)=>{const e=$('#nc_i'+k);
+  if(e)e.textContent=(c.rssi?c.rssi+' dBm':'')+(c.fw?' · build '+fwtxt(c.fw):'')})}
+function ncAdd(mac,k){const i=+$('#nc_s'+k).value,name=(i+1)+'. '+PLANETS[i];
+ fetch('/api/settings').then(r=>r.json()).then(s=>{const old=s.planets.mac_address[i];
+  if(old&&!confirm(name+' already has '+old+'.\nReplace it with '+mac+'?'))return;
+  s.planets.mac_address[i]=mac;
+  return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify(s)}).then(()=>{toast(mac+' added as '+name);setTimeout(loadCfg,300)})})
+ .catch(()=>toast('could not add '+mac))}
+
+/* ---- firmware update: one button; the image's chip id picks cart (C3) or Sun (ESP32) ---- */
 let fwBusy=false;                                 // uploading: keep the progress text on screen
+let fwDlg=false,lastCf={},sunFw=0,sunUpdating=0;  // sunUpdating: Sun build being replaced
 function fwtxt(s,full){if(!s)return '—';          // build stamp (UTC Unix s) -> local time
  const d=new Date(s*1000),p=n=>String(n).padStart(2,'0');
  const t=p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
  return full?d.getFullYear()+'-'+t:t}
-function fwUpload(){const f=$('#fw_file').files[0];if(!f){toast('choose a .bin file');return}
- const fd=new FormData();fd.append('fw',f,f.name);const x=new XMLHttpRequest();fwBusy=true;
- x.upload.onprogress=e=>{if(e.lengthComputable)
-  $('#fw_info').textContent='Uploading '+Math.round(e.loaded*100/e.total)+'%…'};
- x.onloadend=()=>{fwBusy=false;let r={};try{r=JSON.parse(x.responseText)}catch(e){}
-  toast(r.ok?'uploaded':('upload failed: '+(r.error||('HTTP '+x.status))))};
- x.open('POST','/api/planet_fw');x.send(fd)}
+function fwPick(){const i=$('#fw_file');i.value='';fwDlg=true;i.click()}
+function fwDone(f){if(!fwDlg)return;fwDlg=false;f?fwChosen(f):fwNoFile()}   // once per dialog
+function fwInit(){const i=$('#fw_file');
+ i.addEventListener('change',()=>fwDone(i.files[0]));i.addEventListener('cancel',()=>fwDone(null))}
+function fwChosen(f){f.slice(0,24).arrayBuffer().then(b=>{const h=new Uint8Array(b);
+ if(h.length<24||h[0]!==0xE9){toast(f.name+' is not a firmware image');return}
+ const chip=h[12]|h[13]<<8;                       // esp_image_header_t.chip_id: 0 = ESP32, 5 = C3
+ if(chip===5)fwSend('/api/planet_fw',f,false);
+ else if(chip===0){if(confirm(f.name+' is firmware for the Sun itself (ESP32).\n'+
+  'Install it and restart the Sun? The carts stop until it is back.'))fwSend('/api/sun_fw',f,true)}
+ else toast(f.name+' is for another chip: neither the Sun (ESP32) nor a cart (ESP32-C3)')})}
+function fwNoFile(){
+ if(!lastCf.present){toast('No file chosen, and no cart firmware is stored on the Sun');return}
+ if(!confirm('No file chosen.\nInstall the cart firmware stored on the Sun (build '+fwtxt(lastCf.stamp,1)+
+  ') on every cart, including carts on a newer build? They install it while the show is idle.'))return;
+ fetch('/api/cart_fw_push',{method:'POST'}).then(r=>r.json())
+  .then(r=>toast(r.ok?'carts will install the stored build while idle':('push failed: '+r.error)))
+  .catch(()=>toast('push failed'))}
+function fwSend(url,f,sun){const fd=new FormData();fd.append('fw',f,f.name);
+ const x=new XMLHttpRequest();fwBusy=true;
+ x.upload.onprogress=e=>{if(e.lengthComputable)$('#fw_info').textContent=
+  'Uploading '+(sun?'Sun':'cart')+' firmware '+Math.round(e.loaded*100/e.total)+'%…'};
+ x.onloadend=()=>{let r={};try{r=JSON.parse(x.responseText)}catch(e){}
+  fwBusy=!!(r.ok&&sun);
+  if(r.ok&&sun){sunUpdating=sunFw||-1;$('#fw_info').textContent='Installed. The Sun is restarting…';
+   toast('Sun firmware installed: restarting')}
+  else toast(r.ok?'cart firmware stored: carts on an older build update while idle':
+   ('update failed: '+(r.error||('HTTP '+x.status))))};
+ x.open('POST',url);x.send(fd)}
 
 /* ---- settings (recursive form bound to a live cfg object) ---- */
 let cfg=null;
@@ -311,5 +389,5 @@ function saveCfg(){fetch('/api/settings',{method:'POST',headers:{'Content-Type':
 function resetCfg(){if(confirm('Restore ALL settings to factory defaults? This also clears the planet MAC addresses.'))
  fetch('/api/settings/reset',{method:'POST'}).then(()=>{toast('defaults restored');setTimeout(loadCfg,700)})}
 
-buildSky();loadStats();loadCfg();poll();setInterval(poll,1000);setInterval(loadStats,5000);
+buildSky();fwInit();loadStats();loadCfg();poll();setInterval(loadStats,5000);
 </script></body></html>)HTML";
